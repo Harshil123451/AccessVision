@@ -1,0 +1,69 @@
+# Dependency directories
+node_modules/
+.venv/
+venv/
+env/
+ENV/
+
+# Next.js build and cache outputs
+.next/
+out/
+
+# Python build and cache outputs
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables & secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+*.env.*
+!**/.env.example
+
+# Large model files and model cache
+*.pt
+*.pth
+*.bin
+*.onnx
+.cache/
+.cache/huggingface/
+.cache/pip/
+
+# Editor & OS configuration
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# Test reports and temporary logs
+*.log
+reports/latency_percentiles.csv
+load_tests/reports/

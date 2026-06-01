@@ -1,0 +1,49 @@
+import os
+from typing import List, Literal, Union
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore"
+    )
+
+    APP_NAME: str = "AccessVision API"
+    APP_ENV: Literal["development", "production", "testing"] = "development"
+    DEBUG: bool = True
+    PORT: int = 8000
+    HOST: str = "127.0.0.1"
+
+    # AI Engine Configuration
+    INFERENCE_MODE: Literal["local"] = "local"
+    YOLO_MODEL_PATH: str = "yolov8n.pt"
+    CAPTION_MODEL_PATH: str = "Salesforce/blip-image-captioning-base"
+    VQA_MODEL_PATH: str = "Salesforce/blip-vqa-base"
+
+    # Performance Optimizations
+    MAX_IMAGE_SIZE: int = 640
+    JPEG_QUALITY: int = 80
+    SEMAPHORE_LIMIT: int = 4
+
+    # Security
+    API_KEY_SECRET: str = "development-secret-key"
+    ALLOWED_ORIGINS: List[str] = ["*"]
+
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        if isinstance(v, str):
+            # Check if it looks like a JSON list
+            if v.startswith("[") and v.endswith("]"):
+                import json
+                try:
+                    return json.loads(v)
+                except ValueError:
+                    pass
+            return [i.strip() for i in v.split(",")]
+        return v
+
+settings = Settings()
