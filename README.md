@@ -1,142 +1,109 @@
-# AccessVision — Grounded Multimodal AI Accessibility Assistant
+# AccessVision
 
-AccessVision is an AI-powered accessibility camera assistant designed to help visually impaired users navigate their environments. Operating as a mobile-first Progressive Web App (PWA), it streams camera frames, utilizes a custom routing and grounded visual reasoning pipeline to eliminate model hallucination, and reads descriptive scene narrations aloud in real time.
+### AI-powered mobile camera assistant for visually impaired users.
 
-AccessVision is built upon the **WCAG 2.1 AA** guidelines, prioritizing hands-free, high-contrast, and voice-driven design to ensure absolute usability.
+AccessVision is a mobile Progressive Web App (PWA) that translates real-world environments into spoken narration. By combining lightweight object detection with targeted question-answering, the application helps users identify objects, read labels, and ask follow-up questions about their surroundings.
 
----
-
-## ⚡ Key Highlights
-* **📷 Mobile-First Camera Viewfinder**: Fullscreen browser-based camera capture using the `MediaDevices` API, prioritizing rear camera configurations with canvas preprocessing.
-* **🧠 Grounded Multimodal Reasoning**: An intelligent question routing pipeline that intercepts queries to choose the best vision-language execution pathway rather than relying blindly on general Visual Question Answering (VQA).
-* **🎯 YOLOv8 Object Grounding**: Integrates object-bounding constraints to limit VQA models to isolated spatial regions, preventing hallucination during color and text recognition.
-* **🗣️ Voice-First Navigation**: Leverages the Web Speech API (`speechSynthesis` and `webkitSpeechRecognition`) for automatic scene narration readout and voice-to-text follow-up visual Q&A.
-* **⚡ Production-Grade Performance**: Built with asynchronous thread-pool orchestration, concurrent request semaphores, client-side canvas image compression, and detection caching to achieve sub-second p95 latency under concurrent load.
-* **📊 Deep Observability & Telemetry**: Full request-scoped tracing (`contextvars` correlation IDs), structured JSON logs, memory leak defenses, and custom Locust test suites monitoring tail latencies (p95/p99).
-* **📱 Installable PWA**: Responsive layouts configured with service worker offline caching and standalone manifest specifications.
+[Demo](#-demo--screenshots) • [Features](#-key-features) • [Accessibility Impact](#-accessibility-impact) • [How It Works](#-how-it-works) • [Performance](#-performance-benchmarks) • [Setup](#-installation--setup)
 
 ---
 
-## 📸 Demo & Screenshots
+## 📱 Demo & Screenshots
 
 > [!NOTE]
-> Below are layout placeholders to showcase the mobile-first UI, visual tracking, and performance dashboards.
+> The interface is optimized for physical mobile interactions and screen-readers, using large touch targets and high-contrast styling.
 
-| 📱 Mobile Viewfinder | 🌓 High Contrast UI | 🗣️ Voice-First Q&A |
-| :---: | :---: | :---: |
-| ![Mobile viewfinder layout placeholder](docs/screenshots/mobile_viewfinder.jpg) | ![High contrast mode screenshot placeholder](docs/screenshots/high_contrast.jpg) | ![Voice chat thread interface placeholder](docs/screenshots/voice_qa.jpg) |
-| *Fullscreen camera with large, tactile touch targets.* | *True-black high contrast mode for low-vision support.* | *Conversational interface showing speech-to-text outputs.* |
+| Fullscreen Camera | High-Contrast Mode | Spoken Q&A Mode | Developer Telemetry |
+| :---: | :---: | :---: | :---: |
+| ![Camera Viewport](docs/screenshots/camera_view.jpg) | ![High-Contrast Layout](docs/screenshots/contrast_ui.jpg) | ![Voice Interface](docs/screenshots/voice_qa.jpg) | ![Telemetry Board](docs/screenshots/telemetry_dashboard.jpg) |
+| *Tap-to-capture rear viewfinder* | *True-black layout for low vision* | *Hands-free voice dialogue* | *Locust response metrics* |
 
 ---
 
-## 📐 System Architecture
+## ✨ Key Features
 
-AccessVision separates frontend camera interactions and Web Speech features from heavy machine learning inference workloads. The diagram below illustrates how requests flow from the mobile browser through to the grounded reasoning backend:
+* **📷 Fullscreen Viewfinder**: Streams camera feeds directly in the browser utilizing the `MediaDevices` API.
+* **🗣️ Spoken Scene Narration**: Automatically reads descriptions aloud using the Web Speech API.
+* **🎯 Grounded Reasoning**: Isolates specific objects in the frame for targeted questions, preventing visual hallucinations.
+* **🎤 Voice-First Dialogue**: Uses voice-to-text dictation for hands-free interactions.
+* **⚡ Sub-Second Latency**: Employs client-side canvas compression and server caches to keep response speeds fast.
+* **🌓 Low-Vision Friendly**: Features high-contrast dark themes, single-tap font scaling, and semantic screen-reader markup.
+
+---
+
+## 🤝 Accessibility Impact
+
+Standard visual assistants often overwhelm users with walls of text or require typing, which can be challenging. AccessVision addresses this by focusing on:
+* **Independent Navigation**: Users get immediate spoken feedback about what is in front of them without needing assistance.
+* **Reduced Cognitive Load**: Instead of reading a long description of a messy room, the app summarizes the scene and allows the user to ask specific follow-up questions (e.g., *"Where are my keys?"*).
+* **Hands-Free Operation**: Tapping any part of the screen triggers voice dictation, making the tool usable on-the-go.
+
+---
+
+## ⚙️ How It Works
+
+### The Core Flow
+```text
+Phone Camera → Frame Compression → FastAPI Backend → Grounded Routing → ML Inference → Voice Readout
+```
+
+1. **Capture & Compress**: The frontend captures a frame from the camera stream, uses a canvas to compress the image size, and uploads the payload.
+2. **Intent Routing**: The backend inspects the user's question to choose the best ML execution path (e.g., color verification, object counts, or general descriptions).
+3. **Grounded Reasoning**: If asking about a specific item, the backend localizes it using YOLOv8, crops the target area, and runs Visual Question Answering (BLIP VQA) solely on the crop.
+4. **Speech Output**: The backend returns the text response, and the browser reads it aloud using the Web Speech API.
+
+### System Architecture
 
 ```mermaid
 graph TD
-    A[Mobile Phone Viewport] -->|1. User clicks capture| B[MediaDevices Camera Stream]
-    B -->|2. Draw frame & compress| C[Canvas JPEG Export]
-    C -->|3. POST multipart upload| D[Next.js API Rewrite Proxy]
-    D -->|4. Forward LAN request| E[FastAPI Core Server]
-    E -->|5. ContextVar correlation| F[Request Telemetry Tracer]
-    E -->|6. Orchestrate query| G[Question Router Service]
+    A[Mobile Browser] -->|1. Capture frame| B[MediaDevices API]
+    B -->|2. Canvas compression| C[JPEG Export]
+    C -->|3. Upload payload| D[Next.js API Proxy]
+    D -->|4. Forward request| E[FastAPI Backend]
     
-    G -->|Intent = Color/Presence/Counting| H[YOLOv8 Object Detector]
-    G -->|Intent = Description/Fallback| I[BLIP Image Captioning]
-    G -->|Intent = Spatial Reasoning| J[BLIP VQA Pipeline]
+    E -->|5. Identify question intent| F[Question Router]
+    F -->|Intent: Object/Color/Count| G[YOLOv8 Object Detector]
+    F -->|Intent: General Description| H[BLIP Image Captioning]
     
-    H -->|Bounding boxes| K[Crop Service & PIL extraction]
-    K -->|Targeted visual crop| J
-    J -->|Grounded Answer| L[Narration Compiler Service]
-    I -->|Scene Caption| L
+    G -->|Bounding coordinates| I[Crop Service]
+    I -->|Segmented crop| J[BLIP VQA Pipeline]
+    H -->|Raw Caption| K[Narration Compiler]
+    J -->|Grounded Answer| K
     
-    L -->|JSON Response + headers| D
-    D -->|HTTP 200 + Headers| A
-    A -->|7. Autoplay TTS| M[Web Speech Synthesis]
+    K -->|HTTP Response| A
+    A -->|6. Speak response| L[Web Speech Synthesis]
 ```
-
-### 🧠 Grounded Reasoning & Hallucination Mitigation
-Standard VQA models are notorious for hallucinating colors, text, and object counts when presented with a complex, cluttered image because the model's self-attention layers are distracted by background details. 
-
-AccessVision mitigates this through **Grounded Reasoning**:
-1. **Semantic Routing**: The backend inspects the user query using a rules-based routing engine to identify search intent (e.g. asking for "color" triggers the Color Pathway).
-2. **Spatial Isolation**: YOLOv8 locates the target object, and the `CropService` crops it out.
-3. **Targeted VQA**: The BLIP VQA model is query-restricted *solely* to the cropped region, completely preventing background noise from introducing hallucinations.
 
 ---
 
-## 📊 Performance Benchmarks (Locust Load Test)
+## 📊 Performance Benchmarks
 
-Under stress-testing with **50 concurrent simulated users** executing complex visual reasoning queries, AccessVision achieved the following performance metrics:
+AccessVision is optimized to run on standard servers without heavy GPU requirements. Stress-testing with **50 concurrent users** yielded the following improvements:
 
-| Metric | Before Optimization | After Optimization | Improvement |
+| Metric | Unoptimized Backend | Optimized Backend | Improvement |
 | :--- | :--- | :--- | :--- |
-| **API Request Success Rate** | 11.2% (88.8% failure/timeout) | **100% (0.0% failure rate)** | **+88.8% Stability** |
-| **p50 (Median) YOLO Latency** | 1,450 ms | **176 ms** | **87.8% Latency Reduction** |
-| **p95 Grounded Query Routing** | 8,920 ms | **2,406 ms** | **73.0% Latency Reduction** |
-| **p99 Worst-case Query Routing** | 12,410 ms | **2,769 ms** | **77.6% Latency Reduction** |
+| **API Success Rate** | 11.2% (timeouts / drops) | **100% (stable)** | **System stability** |
+| **Object Detection Latency** | 1,450 ms | **176 ms** | **87% faster** |
+| **Grounded Query Response (p95)** | 8,920 ms | **2,406 ms** | **73% faster** |
+| **Worst-case Latency (p99)** | 12,410 ms | **2,769 ms** | **77% faster** |
 
-### Key Optimization Implementations
-1. **Client-Side Image Compression**: Camera frames are resized on a client-side canvas to a max width of `800px` and converted to optimized JPEG, reducing upload payloads by **90%** (from 4MB to ~150KB).
-2. **Inference Caching**: Duplicate image payloads bypass deep neural network execution completely using an MD5-hashed detection cache inside `DetectService`.
-3. **Async Thread Delegation**: Synchronous model predictions are offloaded to non-blocking worker pools via `asyncio.to_thread` to keep the FastAPI event loop responsive.
-4. **Observable Concurrency Semaphore**: Restricts concurrent model invocations to a configured limit, managing queue wait times and protecting VRAM/RAM allocation spikes.
+### Optimization Highlights
+* **Client-Side Preprocessing**: Images are resized to `800px` before upload, reducing data usage by **90%** (~150KB payloads).
+* **Inference Caching**: Duplicate image payloads bypass model execution entirely via MD5 hashing.
+* **Async Thread Offloading**: Synchronous model passes are offloaded to background thread pools, keeping the main FastAPI event loop free.
+* **Resource Limits**: Concurrency semaphores prevent GPU memory bottlenecks during traffic spikes.
 
----
-
-## 📊 Telemetry & Observability
-AccessVision implements a custom request tracing system utilizing thread-local context variables. Each request is tagged with a unique correlation ID:
-
-```text
-[INFO] 2026-06-01 11:50:00 [req_7f8a9] Started POST /api/v1/reason/query
-[INFO] 2026-06-01 11:50:00 [req_7f8a9] [PREPROCESS] Image size: 800x600 (142 KB)
-[INFO] 2026-06-01 11:50:01 [req_7f8a9] [ROUTER] Intent identified: Color Pathway
-[INFO] 2026-06-01 11:50:01 [req_7f8a9] [YOLO] Target found: 'backpack' at [120, 200, 340, 500] (conf: 0.91)
-[INFO] 2026-06-01 11:50:02 [req_7f8a9] [VQA] Executed BLIP VQA on cropped 'backpack' region (18ms)
-[INFO] 2026-06-01 11:50:02 [req_7f8a9] Finished POST /api/v1/reason/query - Status: 200 OK (2240ms)
-```
-
-Through this telemetry, developers can isolate logs per request, track GPU queue contention times, monitor server RAM growth, and identify bottlenecked ML pipelines.
+> [!TIP]
+> To inspect detailed log outputs, tracing configurations, and Locust metrics, see [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 
 ---
 
-## 📂 Repository Structure
-
-```text
-accessvision/
-├── app/                        # FastAPI Backend Application Core
-│   ├── ai/                     # Reusable adapters for YOLO, BLIP, and VQA
-│   ├── api/                    # Route controllers
-│   │   ├── router.py           # Root router joining v1 endpoints
-│   │   └── v1/                 # Endpoints (caption, detect, reason, scene, vqa, health)
-│   ├── core/                   # Config, logging middleware, and telemetry
-│   ├── services/               # Question router, detection, and narration logic
-│   └── utils/                  # Image loading, resizing, and compatibility helpers
-├── docs/                       # Developer guidelines & portfolio assets
-│   └── PUBLICATION_GUIDE.md    # Pre-flight checklist, cleanup scripts & commit advice
-├── frontend/                   # Next.js 15 App Router Frontend
-│   ├── app/                    # Navigation pages (Root view + Camera Diagnostics)
-│   ├── components/             # Camera views, Narration panels, and QA inputs
-│   ├── public/                 # Standalone manifests, icons, and sw.js PWA script
-│   ├── services/               # Axios clients and Web Speech managers
-│   └── store/                  # Zustand global application state
-├── load_tests/                 # Performance testing tools
-│   ├── reports/                # Generated Locust benchmark charts
-│   └── locustfile.py           # Locust load testing test suite
-├── .env.example                # Safe environment variable configuration template
-├── .gitignore                  # Combined Python/Node/VSCode ignore rules
-├── CONTRIBUTING.md             # Developer guidelines
-└── LICENSE                     # MIT License
-```
-
----
-
-## ⚡ Setup & Installation
+## 🛠️ Installation & Setup
 
 ### Backend Setup
-1. Move to the workspace directory:
+1. Clone the repository and navigate to the project directory:
    ```bash
+   git clone https://github.com/Harshil123451/AccessVision.git
    cd accessvision
    ```
 2. Create and activate a Python virtual environment:
@@ -145,16 +112,16 @@ accessvision/
    .venv\Scripts\activate  # Windows
    # source .venv/bin/activate  # macOS/Linux
    ```
-3. Install the dependencies:
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-4. Copy the environment variables template:
+4. Copy the environment template:
    ```bash
    copy .env.example .env  # Windows
    # cp .env.example .env  # macOS/Linux
    ```
-5. Run the FastAPI backend:
+5. Launch the FastAPI server:
    ```bash
    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
    ```
@@ -164,50 +131,35 @@ accessvision/
    ```bash
    cd frontend
    ```
-2. Install the Node packages:
+2. Install Node packages and start the server:
    ```bash
    npm install
-   ```
-3. Start the Next.js development server:
-   ```bash
    npm run dev -- --hostname 0.0.0.0
    ```
+3. Access the application locally at `http://localhost:3000`.
 
 ---
 
-## 📱 Mobile LAN & ngrok Deployment
+## 📱 Mobile & Local Network Testing
 
-To open the camera assistant on a physical phone, you must test over HTTPS to bypass secure origin restrictions.
+To access the camera viewfinder on a physical mobile device, the browser requires an HTTPS connection.
 
-1. Download and authenticate [ngrok](https://ngrok.com/).
-2. Run ngrok in a new terminal window to tunnel your Next.js port:
+1. Install [ngrok](https://ngrok.com/).
+2. Tunnel your Next.js server port:
    ```bash
    ngrok http 3000
    ```
-3. Copy the secure HTTPS forwarding URL (e.g. `https://*************.ngrok-free.dev`).
-4. Ensure your phone and laptop are connected to the same Wi-Fi network.
-5. Navigate to the HTTPS URL on your phone's browser. Tap **Start Camera** and grant permissions.
+3. Open the secure HTTPS URL provided by ngrok on your mobile browser.
+4. Grant camera and microphone permissions when prompted.
 
 ---
 
-## 🎨 Accessibility Focus
-AccessVision prioritizes accessibility at all layers:
-- **Calm, High-Contrast UI**: Supports a true-black high-contrast toggle layout with thick, crisp borders, optimizing visibility for low-vision users.
-- **Keyboard & Screen-Reader friendly**: Employs semantic HTML5 tags with explicit `aria-live` and `aria-label` controls.
-- **Magnified Typography**: Supports one-tap text magnification globally.
-- **Voice-First Navigation**: Reads narration aloud automatically and uses hands-free dictation for question input, removing the need for precise typing.
-
----
-
-## 🎯 Future Roadmap
-- [ ] **Multi-Language Spoken Narration**: Support instant translation and voice readouts in Spanish, French, German, and Hindi.
-- [ ] **Edge Inference Option**: Convert YOLO models to ONNX and run segmentations directly in the browser via ONNX Runtime Web.
-- [ ] **Intelligent Obstacle Tracking**: Incorporate visual flow vector analysis to announce moving obstacles or tripping hazards in real-time.
-- [ ] **Docker Compose Setup**: Package backend and frontend into simple container blueprints for local deployments.
+## 🗺️ Roadmap
+- [ ] **Multi-language Support**: Add Spanish, French, and German speech translation.
+- [ ] **Edge Inference**: Port YOLO to ONNX and run models locally in-browser via WebAssembly.
+- [ ] **Navigation Mode**: Announce path obstructions and depth changes in real-time.
 
 ---
 
 ## 📝 License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-#   A c c e s s V i s i o n  
- 
