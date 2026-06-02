@@ -6,13 +6,13 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 
 | Metric | YOLOv8 Nano (`yolov8n.pt`) | YOLOv8 Small (`yolov8s.pt`) | Delta / Comparison |
 | :--- | :--- | :--- | :--- |
-| **Model Load Time** | 20.7 ms | 23.6 ms | 1.1x load time |
-| **RAM Overhead (Load)** | 20.82 MB | 12.88 MB | +-7.95 MB |
-| **Peak RAM Usage** | 368.10 MB | 459.33 MB | +91.23 MB |
-| **Average Latency** | 28.7 ms | 65.2 ms | 2.3x latency |
-| **Median Latency** | 29.1 ms | 62.7 ms | - |
-| **Latency Range** | 24.8 - 33.4 ms | 57.5 - 95.1 ms | - |
-| **Average CPU Util** | 14.5% | 20.0% | - |
+| **Model Load Time** | 20.0 ms | 22.0 ms | 1.1x load time |
+| **RAM Overhead (Load)** | 20.81 MB | 12.70 MB | +-8.12 MB |
+| **Peak RAM Usage** | 368.80 MB | 460.23 MB | +91.43 MB |
+| **Average Latency** | 28.8 ms | 58.8 ms | 2.0x latency |
+| **Median Latency** | 27.7 ms | 56.5 ms | - |
+| **Latency Range** | 23.4 - 40.0 ms | 51.5 - 77.9 ms | - |
+| **Average CPU Util** | 16.0% | 18.0% | - |
 | **Raw Detections (>0.25)** | 1 | 1 | - |
 | **Accepted Detections (>0.5)** | 1 | 1 | - |
 | **Mean Accepted Confidence** | 90.76% | 90.29% | - |
@@ -22,11 +22,12 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 | Feature | Status | Verification Detail |
 | :--- | :--- | :--- |
 | **Backend Image Mirroring** | ✅ Passed | Verified horizontal pixel flipping on client selfie captures. |
-| **9-Region Grid Narration** | ✅ Passed | Verified correct spatial quadrant narration construction. |
+| **Grounded Narration Anti-Hallucination** | ✅ Passed | Verified removal of ungrounded BLIP entities from scene narration. |
+| **Contradiction Prevention Memory** | ✅ Passed | Verified memory-aware missing object acknowledgement between rolling frames. |
+| **Restricted Spatial Grounding** | ✅ Passed | Verified correct background/foreground mapping instead of vertical descriptors. |
 | **Dark Blue vs Black Detection** | ✅ Passed | Verified mapping dark blue RGB (15,25,45) as dark blue. |
 | **Blue/Black Color Boundary** | ✅ Passed | Verified correct boundary class separation for dark blue and absolute black. |
 | **Textured & Shadowed Surfaces** | ✅ Passed | Verified color extraction on textured pixels with shadows/highlights. |
-| **Hallucination Detection & Filtering** | ✅ Passed | Verified removal of ungrounded BLIP entities from scene narration. |
 
 ## Engineering Analysis & Observations
 

@@ -103,21 +103,24 @@ class SceneService(BaseService):
             # Assess hazards
             hazards = self._assess_hazards(detections)
 
-            # Determine narration confidence
-            has_uncertainty = any(d.confidence < 0.75 for d in detections)
-            narration_confidence = "LOW" if has_uncertainty else "HIGH"
-            logger.info(f"[SCENE] Narration confidence: {narration_confidence}")
             if is_mirrored:
                 logger.info("[CAMERA] Mirrored preview enabled")
             else:
                 logger.info("[CAMERA] Mirrored preview disabled")
 
-            # Generate narration
-            narration = self.narration_service.generate_narration(
-                caption=caption,
-                detections=detections,
-                hazards=hazards
-            )
+            # Generate narration using grounded perception details
+            from app.utils.image import load_image_from_bytes
+            pil_image = load_image_from_bytes(image_bytes)
+            try:
+                narration = self.narration_service.generate_narration(
+                    caption=caption,
+                    detections=detections,
+                    hazards=hazards,
+                    pil_image=pil_image,
+                    recent_memory=self.get_recent_memory()
+                )
+            finally:
+                pil_image.close()
 
         result = SceneAnalysisResult(
             success=True,

@@ -146,49 +146,6 @@ def validate_image_mirroring():
         print(f"❌ Image mirroring validation failed: {str(e)}")
         return False
 
-def validate_grid_narration():
-    """Validates the 9-region grid spatial narration mapping."""
-    print("\n--- Validating 9-Region Grid Narration ---")
-    try:
-        service = NarrationService()
-        
-        # Place items in different grid quadrants
-        # Grid coordinates range: [0.0, 1.0]
-        detections = [
-            # Center-middle: "directly in front of you"
-            DetectionItem(label="cup", confidence=0.9, box=[0.4, 0.4, 0.5, 0.5]),
-            # Left-middle: "to your left"
-            DetectionItem(label="chair", confidence=0.8, box=[0.1, 0.4, 0.2, 0.5]),
-            # Right-middle: "to your right"
-            DetectionItem(label="dog", confidence=0.85, box=[0.8, 0.4, 0.9, 0.5]),
-            # Center-upper: "directly above you"
-            DetectionItem(label="lamp", confidence=0.78, box=[0.4, 0.1, 0.5, 0.2]),
-            # Center-lower: "directly below you, I think there may be"
-            DetectionItem(label="shoes", confidence=0.65, box=[0.4, 0.8, 0.5, 0.9]),
-            # Upper-left: "in the upper left"
-            DetectionItem(label="clock", confidence=0.9, box=[0.1, 0.1, 0.2, 0.2]),
-            # Lower-right: "in the lower right, I think there may be"
-            DetectionItem(label="cat", confidence=0.55, box=[0.8, 0.8, 0.9, 0.9])
-        ]
-        
-        narration = service.generate_narration("a room", detections, [])
-        print(f"Generated narration:\n  \"{narration}\"")
-        
-        # Verify spatial components
-        assert "directly in front of you" in narration, "Missing center-middle location phrasing"
-        assert "to your left" in narration, "Missing left-middle location phrasing"
-        assert "to your right" in narration, "Missing right-middle location phrasing"
-        assert "directly above you" in narration, "Missing center-upper location phrasing"
-        assert "directly below you, I think there may be" in narration, "Missing center-lower location phrasing"
-        assert "in the upper left" in narration, "Missing upper-left quadrant phrasing"
-        assert "in the lower right, I think there may be" in narration, "Missing lower-right quadrant phrasing"
-        
-        print("✅ 9-region grid spatial narration validation passed!")
-        return True
-    except Exception as e:
-        print(f"❌ Grid spatial narration validation failed: {str(e)}")
-        return False
-
 def validate_dark_object_color():
     """Validates that dark blue colors are classified as 'dark blue' instead of 'black'."""
     print("\n--- Validating Dark Blue vs Black Color Extraction ---")
@@ -240,20 +197,17 @@ def validate_textured_surface_color():
     try:
         service = ColorService()
         
-        # Create an image containing mostly red pixels (200, 20, 20),
-        # but with some shadow pixels (10, 10, 10) and highlight pixels (255, 255, 255)
         img = Image.new("RGB", (100, 100))
         pixels = []
         for y in range(100):
             for x in range(100):
-                # 70% main red, 15% shadow, 15% highlight
                 rand = np.random.rand()
                 if rand < 0.70:
                     pixels.append((200, 20, 20))
                 elif rand < 0.85:
-                    pixels.append((10, 10, 10)) # shadow
+                    pixels.append((10, 10, 10))
                 else:
-                    pixels.append((255, 255, 255)) # highlight
+                    pixels.append((255, 255, 255))
                     
         img.putdata(pixels)
         res = service.analyze_color(img, detection_confidence=0.9)
@@ -266,29 +220,81 @@ def validate_textured_surface_color():
         print(f"❌ Textured surface validation failed: {str(e)}")
         return False
 
-def validate_hallucination_filtering():
-    """Validates that hallucinated entities in captions are suppressed."""
-    print("\n--- Validating Caption Hallucination Filtering ---")
+def validate_hallucinated_people():
+    """Verifies that ungrounded people/animals/laptops are not mentioned in narration."""
+    print("\n--- Validating Grounded Narration Anti-Hallucination ---")
     try:
         service = NarrationService()
-        
-        # Scenario: Caption mentions "laptop" and "bed", but only a "bed" was detected by YOLO.
         detections = [
             DetectionItem(label="bed", confidence=0.88, box=[100, 200, 500, 600])
         ]
-        caption = "a bedroom containing a large bed and a laptop on a table"
+        caption = "a woman laying on a bed with a laptop"
+        img = Image.new("RGB", (640, 640), color=(128, 128, 128))
         
-        filtered = service.filter_hallucinations(caption, detections)
+        narration = service.generate_narration(caption, detections, [], pil_image=img)
         print(f"Original caption: '{caption}'")
-        print(f"Filtered caption: '{filtered}'")
+        print(f"Generated narration:\n  \"{narration}\"")
         
-        assert "laptop" not in filtered, "Hallucinated 'laptop' was not filtered out!"
-        assert "table" not in filtered, "Hallucinated 'table' was not filtered out!"
-        assert "bed" in filtered, "Grounded 'bed' was incorrectly filtered!"
-        print("✅ Hallucination filtering validation passed!")
+        assert "woman" not in narration.lower(), "Hallucinated 'woman' was not suppressed!"
+        assert "laptop" not in narration.lower(), "Hallucinated 'laptop' was not suppressed!"
+        assert "bed" in narration.lower(), "Grounded 'bed' was missing!"
+        print("✅ Grounded Narration Anti-Hallucination validation passed!")
         return True
     except Exception as e:
-        print(f"❌ Hallucination filtering validation failed: {str(e)}")
+        print(f"❌ Grounded Narration Anti-Hallucination validation failed: {str(e)}")
+        return False
+
+def validate_contradictory_narration():
+    """Verifies that missing objects between frames trigger memory alerts instead of contradictions."""
+    print("\n--- Validating Contradiction Prevention Memory ---")
+    try:
+        service = NarrationService()
+        img = Image.new("RGB", (640, 640), color=(128, 128, 128))
+        
+        # Rolling memory: Frame 1 has a person
+        memory = [{
+            "detections": [{"label": "person", "box": [50, 50, 200, 200], "confidence": 0.85}]
+        }]
+        
+        # Current frame: Frame 2 has no person, only a suitcase
+        detections = [
+            DetectionItem(label="suitcase", confidence=0.90, box=[100, 100, 300, 300])
+        ]
+        
+        narration = service.generate_narration("a room with a suitcase", detections, [], pil_image=img, recent_memory=memory)
+        print(f"Generated memory-aware narration:\n  \"{narration}\"")
+        
+        assert "no longer confident" in narration.lower() or "person was recently visible" in narration.lower(), "Missing person was not acknowledged!"
+        assert "suitcase" in narration.lower(), "Current suitcase was missing!"
+        print("✅ Contradiction prevention memory validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Contradiction prevention memory validation failed: {str(e)}")
+        return False
+
+def validate_spatial_rewriting():
+    """Verifies that confusing depth terms like 'above/below you' are replaced with structured terms."""
+    print("\n--- Validating Restricted Spatial Grounding ---")
+    try:
+        service = NarrationService()
+        img = Image.new("RGB", (640, 640), color=(128, 128, 128))
+        
+        # Object at top center
+        detections = [
+            DetectionItem(label="clock", confidence=0.88, box=[290, 10, 350, 70])
+        ]
+        
+        narration = service.generate_narration("a wall with a clock", detections, [], pil_image=img)
+        print(f"Generated spatial narration:\n  \"{narration}\"")
+        
+        # Make sure "above you" and "below you" are NOT in narration
+        assert "above you" not in narration.lower(), "Confusing term 'above you' was used!"
+        assert "below you" not in narration.lower(), "Confusing term 'below you' was used!"
+        assert "center background" in narration.lower() or "background" in narration.lower(), "Correct spatial term not found!"
+        print("✅ Restricted spatial grounding validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Restricted spatial grounding validation failed: {str(e)}")
         return False
 
 def main():
@@ -298,11 +304,12 @@ def main():
     
     # Run functional validations first
     mirroring_passed = validate_image_mirroring()
-    grid_passed = validate_grid_narration()
     dark_blue_passed = validate_dark_object_color()
     blue_black_passed = validate_blue_vs_black()
     textured_passed = validate_textured_surface_color()
-    hallucination_passed = validate_hallucination_filtering()
+    hallucination_passed = validate_hallucinated_people()
+    contradiction_passed = validate_contradictory_narration()
+    spatial_passed = validate_spatial_rewriting()
     
     # Run performance benchmarking
     test_image = generate_test_image()
@@ -337,11 +344,12 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 | Feature | Status | Verification Detail |
 | :--- | :--- | :--- |
 | **Backend Image Mirroring** | {"✅ Passed" if mirroring_passed else "❌ Failed"} | Verified horizontal pixel flipping on client selfie captures. |
-| **9-Region Grid Narration** | {"✅ Passed" if grid_passed else "❌ Failed"} | Verified correct spatial quadrant narration construction. |
+| **Grounded Narration Anti-Hallucination** | {"✅ Passed" if hallucination_passed else "❌ Failed"} | Verified removal of ungrounded BLIP entities from scene narration. |
+| **Contradiction Prevention Memory** | {"✅ Passed" if contradiction_passed else "❌ Failed"} | Verified memory-aware missing object acknowledgement between rolling frames. |
+| **Restricted Spatial Grounding** | {"✅ Passed" if spatial_passed else "❌ Failed"} | Verified correct background/foreground mapping instead of vertical descriptors. |
 | **Dark Blue vs Black Detection** | {"✅ Passed" if dark_blue_passed else "❌ Failed"} | Verified mapping dark blue RGB (15,25,45) as dark blue. |
 | **Blue/Black Color Boundary** | {"✅ Passed" if blue_black_passed else "❌ Failed"} | Verified correct boundary class separation for dark blue and absolute black. |
 | **Textured & Shadowed Surfaces** | {"✅ Passed" if textured_passed else "❌ Failed"} | Verified color extraction on textured pixels with shadows/highlights. |
-| **Hallucination Detection & Filtering** | {"✅ Passed" if hallucination_passed else "❌ Failed"} | Verified removal of ungrounded BLIP entities from scene narration. |
 
 ## Engineering Analysis & Observations
 

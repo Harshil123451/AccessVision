@@ -196,7 +196,13 @@ class QuestionRouterService(BaseService):
                             else:
                                 answer = f"I think there may be a {target_object} in the scene (detected with {confidence:.0%} confidence)."
                         else:
-                            answer = f"No, I did not detect any {plural} in the scene."
+                            # Contradiction Prevention: check rolling scene memory
+                            recent = self.scene_service.get_recent_memory()
+                            prev_labels = {d["label"].lower() for d in recent[-1].get("detections", [])} if recent else set()
+                            if target_object in prev_labels:
+                                answer = f"A {target_object} was recently visible, but I am not confident that it is present now."
+                            else:
+                                answer = f"No, I did not detect any {plural} in the scene."
                         grounded_by = "yolo_detection"
                     else:
                         # Fallback to VQA if no clear target object identified
