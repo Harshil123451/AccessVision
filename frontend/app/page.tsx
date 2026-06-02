@@ -34,6 +34,7 @@ export default function Home() {
     setCameraActive,
     accessibility,
     updateAccessibility,
+    facingMode,
   } = useAppStore();
 
   const { highContrast, largeText } = accessibility;
@@ -84,7 +85,7 @@ export default function Home() {
       const compressedBlob = await compressImage(dataUrl, 800, 0.8);
       
       // Call visual question router query endpoint
-      const result = await queryReasoningPipeline(compressedBlob, "Describe what you see.");
+      const result = await queryReasoningPipeline(compressedBlob, "Describe what you see.", facingMode === "user");
       
       setNarration(result.answer);
       
@@ -177,6 +178,7 @@ export default function Home() {
                 src={capturedImage}
                 alt="Captured visual context frame being analyzed"
                 className="w-full h-full object-cover"
+                style={{ transform: facingMode === "user" ? "scaleX(-1)" : "scaleX(1)" }}
               />
               {/* Reset layout button on top of image */}
               <button

@@ -16,10 +16,11 @@ export default function CameraPreview({ videoRef }: CameraPreviewProps) {
     setCameraActive,
     error,
     setError,
+    facingMode,
+    setFacingMode,
   } = useAppStore();
 
   const [stream, setStream] = useState<MediaStream | null>(null);
-  const [facingMode, setFacingMode] = useState<"user" | "environment">("environment");
   const [isInitializing, setIsInitializing] = useState(false);
 
   // Starts the camera stream using facingMode
@@ -129,7 +130,8 @@ export default function CameraPreview({ videoRef }: CameraPreviewProps) {
           autoPlay
           playsInline
           muted
-          className="w-full h-full object-cover transform scale-x-100"
+          className="w-full h-full object-cover"
+          style={{ transform: facingMode === "user" ? "scaleX(-1)" : "scaleX(1)" }}
           aria-label="Live camera preview feed"
         />
       )}

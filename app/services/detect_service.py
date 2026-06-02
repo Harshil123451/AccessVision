@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 from app.services.base import BaseService
 from app.ai.registry import ModelRegistry
 from app.core.config import settings
@@ -39,14 +40,18 @@ class DetectService(BaseService):
             "size": len(cls._cache)
         }
 
-    async def detect_objects(self, image_bytes: bytes, confidence: float = 0.25) -> DetectionResult:
+    async def detect_objects(self, image_bytes: bytes, confidence: Optional[float] = None) -> DetectionResult:
         """Asynchronously processes raw image bytes and runs YOLO object detection.
         
         Uses run_in_thread to run synchronous ML inference in a non-blocking worker thread.
         Uses cached detection results if the exact payload was already processed.
         """
+        if confidence is None:
+            confidence = settings.YOLO_CONFIDENCE_THRESHOLD
+
         logger.info(f"Starting object detection process (conf threshold: {confidence})")
         from app.core.telemetry import trace_stage, get_current_telemetry
+        import time
         
         # 1. Check cache first to bypass inference pipeline entirely
         with trace_stage("CACHE_LOOKUP"):
@@ -62,7 +67,14 @@ class DetectService(BaseService):
                 telemetry.cache_hit = True
                 telemetry.add_trace("[CACHE HIT] reused YOLO detections")
                 telemetry.add_trace(f"[CACHE STATS] hit_ratio={stats['hit_ratio_percent']}%")
-            return self._cache[cache_key]
+            
+            cached_result = self._cache[cache_key]
+            logger.info(f"[YOLO] Using {settings.YOLO_MODEL_PATH}")
+            logger.info(f"[YOLO] Threshold: {confidence}")
+            logger.info(f"[YOLO] Raw detections: {len(cached_result.detections)}")
+            logger.info(f"[YOLO] Accepted detections (>{confidence}): {len(cached_result.detections)}")
+            logger.info("[YOLO] Inference completed in 0.0ms (Cache Hit)")
+            return cached_result
             
         DetectService._cache_misses += 1
         stats = self.get_cache_stats()
@@ -84,31 +96,40 @@ class DetectService(BaseService):
                     optimized_image = resize_image_for_model(image, max_size=640)
                 
                 # 5. Perform inference inside thread pool
+                base_confidence = min(0.25, confidence)
+                yolo_start = time.perf_counter()
                 raw_detections = await run_in_thread(
                     self.model_wrapper.predict, 
                     optimized_image, 
-                    confidence_threshold=confidence
+                    confidence_threshold=base_confidence
                 )
+                yolo_latency_ms = round((time.perf_counter() - yolo_start) * 1000, 2)
                 
                 # 6. Clean up PIL images explicitly to save RAM
                 if optimized_image is not image:
                     optimized_image.close()
                 image.close()
 
-            # 7. Map raw output list of dicts to schema items
+            # 7. Map raw output list of dicts to schema items, filtering by target confidence
+            raw_count = len(raw_detections)
+            accepted_detections_raw = [d for d in raw_detections if d["confidence"] >= confidence]
+            accepted_count = len(accepted_detections_raw)
+            
             detections = [
                 DetectionItem(
                     box=d["box"],
                     label=d["label"],
                     confidence=d["confidence"]
-                ) for d in raw_detections
+                ) for d in accepted_detections_raw
             ]
 
-        # Get latency metrics if available
-        latency_ms = 0.0
-        if telemetry and "YOLO" in telemetry.timings:
-            latency_ms = telemetry.timings["YOLO"]
-            logger.info(f"[YOLO] Inference completed in {latency_ms}ms. Detections found: {len(detections)}")
+        # Get latency metrics
+        latency_ms = yolo_latency_ms
+        logger.info(f"[YOLO] Using {settings.YOLO_MODEL_PATH}")
+        logger.info(f"[YOLO] Threshold: {confidence}")
+        logger.info(f"[YOLO] Raw detections: {raw_count}")
+        logger.info(f"[YOLO] Accepted detections (>{confidence}): {accepted_count}")
+        logger.info(f"[YOLO] Inference completed in {latency_ms:.1f}ms")
 
         result = DetectionResult(
             success=True,

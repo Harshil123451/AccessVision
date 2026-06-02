@@ -13,15 +13,16 @@ router = APIRouter()
 )
 async def analyze_scene(
     file: UploadFile = File(..., description="Target image file"),
+    is_mirrored: bool = Form(default=False, description="Whether the camera preview was mirrored"),
     service: SceneService = Depends(SceneService),
     api_key: str = Depends(verify_api_key)
 ):
     # Read and preprocess raw file bytes once at entry point to optimize size/format
     from app.utils.image import preprocess_image_bytes
     image_bytes = await file.read()
-    optimized_bytes = preprocess_image_bytes(image_bytes)
+    optimized_bytes = preprocess_image_bytes(image_bytes, is_mirrored=is_mirrored)
     
-    result = await service.analyze_scene(optimized_bytes)
+    result = await service.analyze_scene(optimized_bytes, is_mirrored=is_mirrored)
     return result
 
 @router.get(

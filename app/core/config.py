@@ -19,7 +19,8 @@ class Settings(BaseSettings):
 
     # AI Engine Configuration
     INFERENCE_MODE: Literal["local"] = "local"
-    YOLO_MODEL_PATH: str = "yolov8n.pt"
+    YOLO_MODEL_PATH: str = "yolov8s.pt"
+    YOLO_CONFIDENCE_THRESHOLD: float = 0.5
     CAPTION_MODEL_PATH: str = "Salesforce/blip-image-captioning-base"
     VQA_MODEL_PATH: str = "Salesforce/blip-vqa-base"
 

@@ -35,6 +35,7 @@ export interface StoreState {
   hasCameraPermission: boolean | null;
   cameraActive: boolean;
   capturedImage: string | null; // base64 representation of captured frame
+  facingMode: "user" | "environment";
   
   // API & Processing State
   loading: boolean;
@@ -53,6 +54,7 @@ export interface StoreState {
   setCameraPermission: (permission: boolean | null) => void;
   setCameraActive: (active: boolean) => void;
   setCapturedImage: (image: string | null) => void;
+  setFacingMode: (mode: "user" | "environment") => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setNarration: (narration: string | null) => void;

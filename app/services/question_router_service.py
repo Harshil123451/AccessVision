@@ -79,7 +79,7 @@ class QuestionRouterService(BaseService):
         logger.info(f"Routed question: '{question}' -> intent: {intent}, target_object: {target_object}")
         return intent, target_object
 
-    async def route_and_reason(self, image_bytes: bytes, question: str) -> ReasoningResult:
+    async def route_and_reason(self, image_bytes: bytes, question: str, is_mirrored: bool = False) -> ReasoningResult:
         """Orchestrates the grounded multimodal reasoning flow."""
         intent, target_object = self.analyze_question(question)
         from app.core.telemetry import trace_stage, get_current_telemetry
@@ -118,7 +118,10 @@ class QuestionRouterService(BaseService):
                             color = self.color_service.get_dominant_color(cropped_pil)
                         finally:
                             cropped_pil.close()
-                        answer = f"The {target_object} is {color}."
+                        if best_match.confidence >= 0.75:
+                            answer = f"The {target_object} is {color}."
+                        else:
+                            answer = f"I think the {target_object} may be {color}."
                         grounded_by = "color_service"
                     else:
                         # Grounded Uncertainty Response: avoid color hallucination for non-existent objects
@@ -137,23 +140,40 @@ class QuestionRouterService(BaseService):
                     detections = detect_res.detections
                     
                     if target_object:
-                        count = sum(1 for d in detections if d.label == target_object)
+                        matching_dets = [d for d in detections if d.label == target_object]
+                        count = len(matching_dets)
                         plural = target_object + "s" if not target_object.endswith("s") else target_object
                         if count == 0:
                             answer = f"I could not confidently detect any {plural} in the image."
-                        elif count == 1:
-                            answer = f"There is one {target_object} in the image."
                         else:
-                            answer = f"There are {count} {plural} in the image."
+                            all_high_conf = all(d.confidence >= 0.75 for d in matching_dets)
+                            if all_high_conf:
+                                if count == 1:
+                                    answer = f"There is one {target_object} in the image."
+                                else:
+                                    answer = f"There are {count} {plural} in the image."
+                            else:
+                                if count == 1:
+                                    answer = f"I think there may be a {target_object} in the image."
+                                else:
+                                    answer = f"I think there may be about {count} {plural} in the image."
                     else:
                         # Generic counting: count total objects
                         count = len(detections)
                         if count == 0:
                             answer = "I do not see any objects in the scene."
-                        elif count == 1:
-                            answer = "I see only one object in the scene."
                         else:
-                            answer = f"I count {count} objects in the scene."
+                            all_high_conf = all(d.confidence >= 0.75 for d in detections)
+                            if all_high_conf:
+                                if count == 1:
+                                    answer = "I see only one object in the scene."
+                                else:
+                                    answer = f"I count {count} objects in the scene."
+                            else:
+                                if count == 1:
+                                    answer = "I think I see one object in the scene."
+                                else:
+                                    answer = f"I think there may be about {count} objects in the scene."
                     grounded_by = "yolo_detection"
 
                 # --- PATHWAY 3: OBJECT PRESENCE ---
@@ -162,11 +182,14 @@ class QuestionRouterService(BaseService):
                     detections = detect_res.detections
                     
                     if target_object:
-                        found = any(d.label == target_object for d in detections)
+                        matching_dets = [d for d in detections if d.label == target_object]
                         plural = target_object + "s" if not target_object.endswith("s") else target_object
-                        if found:
-                            confidence = max(d.confidence for d in detections if d.label == target_object)
-                            answer = f"Yes, I detected a {target_object} in the scene with {confidence:.0%} confidence."
+                        if matching_dets:
+                            confidence = max(d.confidence for d in matching_dets)
+                            if confidence >= 0.75:
+                                answer = f"Yes, I confidently detected a {target_object} in the scene (with {confidence:.0%} confidence)."
+                            else:
+                                answer = f"I think there may be a {target_object} in the scene (detected with {confidence:.0%} confidence)."
                         else:
                             answer = f"No, I did not detect any {plural} in the scene."
                         grounded_by = "yolo_detection"
@@ -194,7 +217,10 @@ class QuestionRouterService(BaseService):
                             cropped_pil.close()
                         
                         vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
-                        answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
+                        if best_match.confidence >= 0.75:
+                            answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
+                        else:
+                            answer = f"I think I see a {best_match.label} region. Based on that: {vqa_res.answer}"
                         grounded_by = "cropped_vqa_ocr"
                     else:
                         # Fallback to full-image VQA with disclaimer
@@ -207,7 +233,7 @@ class QuestionRouterService(BaseService):
 
                 # --- PATHWAY 5: SCENE DESCRIPTION ---
                 elif intent == "scene_description":
-                    scene_res = await self.scene_service.analyze_scene(image_bytes)
+                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored)
                     answer = scene_res.narration
                     detections = scene_res.objects
                     grounded_by = "scene_service"
@@ -251,6 +277,16 @@ class QuestionRouterService(BaseService):
         finally:
             pil_image.close()
             
+        # Log telemetry details if not already handled by scene service
+        if intent != "scene_description":
+            has_uncertainty = any(d.confidence < 0.75 for d in detections) if detections else False
+            narration_confidence = "LOW" if has_uncertainty else "HIGH"
+            logger.info(f"[SCENE] Narration confidence: {narration_confidence}")
+            if is_mirrored:
+                logger.info("[CAMERA] Mirrored preview enabled")
+            else:
+                logger.info("[CAMERA] Mirrored preview disabled")
+
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
         return ReasoningResult(
             success=True,

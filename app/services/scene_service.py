@@ -79,7 +79,7 @@ class SceneService(BaseService):
                 
         return hazards
 
-    async def analyze_scene(self, image_bytes: bytes, detections: Optional[List[DetectionItem]] = None) -> SceneAnalysisResult:
+    async def analyze_scene(self, image_bytes: bytes, detections: Optional[List[DetectionItem]] = None, is_mirrored: bool = False) -> SceneAnalysisResult:
         """Runs image captioning and object detection. If pre-computed detections are provided,
         reuses them to bypass redundant object detection inference.
         """
@@ -102,6 +102,15 @@ class SceneService(BaseService):
 
             # Assess hazards
             hazards = self._assess_hazards(detections)
+
+            # Determine narration confidence
+            has_uncertainty = any(d.confidence < 0.75 for d in detections)
+            narration_confidence = "LOW" if has_uncertainty else "HIGH"
+            logger.info(f"[SCENE] Narration confidence: {narration_confidence}")
+            if is_mirrored:
+                logger.info("[CAMERA] Mirrored preview enabled")
+            else:
+                logger.info("[CAMERA] Mirrored preview disabled")
 
             # Generate narration
             narration = self.narration_service.generate_narration(

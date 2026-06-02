@@ -93,11 +93,13 @@ export async function compressImage(
 export async function queryReasoningPipeline(
   imageBlob: Blob,
   question: string,
+  isMirrored: boolean = false,
   retries: number = 2
 ): Promise<ReasoningResult> {
   const formData = new FormData();
   formData.append("file", imageBlob, "frame.jpg");
   formData.append("question", question);
+  formData.append("is_mirrored", isMirrored ? "true" : "false");
 
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
     try {

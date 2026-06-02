@@ -48,7 +48,7 @@ def save_image_to_bytes(image: Image.Image, format: str = "JPEG") -> bytes:
     image.save(buf, format=format)
     return buf.getvalue()
 
-def preprocess_image_bytes(image_bytes: bytes) -> bytes:
+def preprocess_image_bytes(image_bytes: bytes, is_mirrored: bool = False) -> bytes:
     """Preprocesses raw uploaded image bytes by decoding, resizing (to MAX_IMAGE_SIZE),
     converting to optimized RGB JPEG (at JPEG_QUALITY), and returning optimized bytes.
     
@@ -66,6 +66,9 @@ def preprocess_image_bytes(image_bytes: bytes) -> bytes:
                 # Convert to RGB to ensure JPEG compatibility and prevent alpha channel issues
                 if img.mode not in ("RGB", "L"):
                     img = img.convert("RGB")
+                if is_mirrored:
+                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    logger.info("[CAMERA] Mirrored preview enabled, flipping image horizontally on backend.")
             
             with trace_stage("RESIZE"):
                 # Resize

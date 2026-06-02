@@ -18,6 +18,7 @@ export default function QABox() {
     isListening,
     setIsListening,
     accessibility,
+    facingMode,
   } = useAppStore();
 
   const { largeText, highContrast, autoplaySpeech } = accessibility;
@@ -73,7 +74,7 @@ export default function QABox() {
       const compressedBlob = await compressImage(capturedImage, 640, 0.75);
 
       // 3. Dispatch to API
-      const result = await queryReasoningPipeline(compressedBlob, activeQuestion);
+      const result = await queryReasoningPipeline(compressedBlob, activeQuestion, facingMode === "user");
 
       // 4. Save to history
       const qaItem = {
