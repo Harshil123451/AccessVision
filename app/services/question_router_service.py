@@ -111,17 +111,22 @@ class QuestionRouterService(BaseService):
                     if matching_dets:
                         # Select the highest confidence detection
                         best_match = max(matching_dets, key=lambda x: x.confidence)
-                        # Crop image region
+                        # Crop image region with default safety inset
                         cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
                         try:
-                            # Extract dominant color directly without VQA
-                            color = self.color_service.get_dominant_color(cropped_pil)
+                            # Extract dominant color and confidence
+                            color_analysis = self.color_service.analyze_color(cropped_pil, best_match.confidence)
+                            color_name = color_analysis["color_name"]
+                            color_conf = color_analysis["confidence"]
                         finally:
                             cropped_pil.close()
-                        if best_match.confidence >= 0.75:
-                            answer = f"The {target_object} is {color}."
-                        else:
-                            answer = f"I think the {target_object} may be {color}."
+                        
+                        if color_conf == "HIGH":
+                            answer = f"The {target_object} is {color_name}."
+                        elif color_conf == "MEDIUM":
+                            answer = f"The {target_object} appears to be {color_name}."
+                        else: # LOW
+                            answer = f"I cannot confidently determine the color of the {target_object}."
                         grounded_by = "color_service"
                     else:
                         # Grounded Uncertainty Response: avoid color hallucination for non-existent objects
@@ -256,9 +261,22 @@ class QuestionRouterService(BaseService):
                             center_y = (ymin + ymax) / 2.0 / h
                             
                             x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
-                            y_pos = "top" if center_y < 0.33 else ("bottom" if center_y > 0.66 else "middle")
+                            y_pos = "upper" if center_y < 0.33 else ("lower" if center_y > 0.66 else "middle")
                             
-                            context_elements.append(f"{d.label} at the {y_pos}-{x_pos} of the image")
+                            if x_pos == "center" and y_pos == "middle":
+                                pos_str = "directly in front of you"
+                            elif x_pos == "center" and y_pos == "upper":
+                                pos_str = "directly above you"
+                            elif x_pos == "center" and y_pos == "lower":
+                                pos_str = "directly below you"
+                            elif y_pos == "upper":
+                                pos_str = f"in the upper {x_pos}"
+                            elif y_pos == "lower":
+                                pos_str = f"in the lower {x_pos}"
+                            else:
+                                pos_str = f"to your {x_pos}"
+                            
+                            context_elements.append(f"{d.label} is {pos_str}")
                         
                         grounding_context = "Grounded visual object coordinates: " + ", ".join(context_elements) + ". "
                         augmented_question = f"{grounding_context}Question: {question}"

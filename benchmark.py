@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.schemas.detect import DetectionItem
 from app.services.narration_service import NarrationService
+from app.services.color_service import ColorService
 from app.utils.image import preprocess_image_bytes
 
 def get_memory_usage():
@@ -188,6 +189,108 @@ def validate_grid_narration():
         print(f"❌ Grid spatial narration validation failed: {str(e)}")
         return False
 
+def validate_dark_object_color():
+    """Validates that dark blue colors are classified as 'dark blue' instead of 'black'."""
+    print("\n--- Validating Dark Blue vs Black Color Extraction ---")
+    try:
+        service = ColorService()
+        # Simulated dark blue crop: RGB (15, 25, 45)
+        img = Image.new("RGB", (64, 64), color=(15, 25, 45))
+        res = service.analyze_color(img, detection_confidence=0.9)
+        color = res["color_name"]
+        confidence = res["confidence"]
+        print(f"Classified: '{color}', Confidence: {confidence}, HSV: {res['hsv']}")
+        assert color == "dark blue", f"Expected 'dark blue', got '{color}'"
+        print("✅ Dark blue color validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Dark blue color validation failed: {str(e)}")
+        return False
+
+def validate_blue_vs_black():
+    """Validates color differentiation between absolute black and dark blue."""
+    print("\n--- Validating Blue vs Black Differentiation ---")
+    try:
+        service = ColorService()
+        
+        # Black crop: RGB (10, 10, 10)
+        img_black = Image.new("RGB", (64, 64), color=(10, 10, 10))
+        res_black = service.analyze_color(img_black, detection_confidence=0.9)
+        color_black = res_black["color_name"]
+        
+        # Dark Blue crop: RGB (12, 18, 50)
+        img_blue = Image.new("RGB", (64, 64), color=(12, 18, 50))
+        res_blue = service.analyze_color(img_blue, detection_confidence=0.9)
+        color_blue = res_blue["color_name"]
+        
+        print(f"Black crop classified as: '{color_black}'")
+        print(f"Dark Blue crop classified as: '{color_blue}'")
+        
+        assert color_black == "black", f"Expected black, got {color_black}"
+        assert color_blue == "dark blue", f"Expected dark blue, got {color_blue}"
+        print("✅ Blue vs Black differentiation validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Blue vs Black differentiation validation failed: {str(e)}")
+        return False
+
+def validate_textured_surface_color():
+    """Validates color clustering on textured surfaces with shadow and highlight pixels."""
+    print("\n--- Validating Textured Surface Color Clustering ---")
+    try:
+        service = ColorService()
+        
+        # Create an image containing mostly red pixels (200, 20, 20),
+        # but with some shadow pixels (10, 10, 10) and highlight pixels (255, 255, 255)
+        img = Image.new("RGB", (100, 100))
+        pixels = []
+        for y in range(100):
+            for x in range(100):
+                # 70% main red, 15% shadow, 15% highlight
+                rand = np.random.rand()
+                if rand < 0.70:
+                    pixels.append((200, 20, 20))
+                elif rand < 0.85:
+                    pixels.append((10, 10, 10)) # shadow
+                else:
+                    pixels.append((255, 255, 255)) # highlight
+                    
+        img.putdata(pixels)
+        res = service.analyze_color(img, detection_confidence=0.9)
+        color = res["color_name"]
+        print(f"Textured surface dominant color: '{color}', Confidence: {res['confidence']}")
+        assert "red" in color, f"Expected red-based color, got '{color}'"
+        print("✅ Textured surface validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Textured surface validation failed: {str(e)}")
+        return False
+
+def validate_hallucination_filtering():
+    """Validates that hallucinated entities in captions are suppressed."""
+    print("\n--- Validating Caption Hallucination Filtering ---")
+    try:
+        service = NarrationService()
+        
+        # Scenario: Caption mentions "laptop" and "bed", but only a "bed" was detected by YOLO.
+        detections = [
+            DetectionItem(label="bed", confidence=0.88, box=[100, 200, 500, 600])
+        ]
+        caption = "a bedroom containing a large bed and a laptop on a table"
+        
+        filtered = service.filter_hallucinations(caption, detections)
+        print(f"Original caption: '{caption}'")
+        print(f"Filtered caption: '{filtered}'")
+        
+        assert "laptop" not in filtered, "Hallucinated 'laptop' was not filtered out!"
+        assert "table" not in filtered, "Hallucinated 'table' was not filtered out!"
+        assert "bed" in filtered, "Grounded 'bed' was incorrectly filtered!"
+        print("✅ Hallucination filtering validation passed!")
+        return True
+    except Exception as e:
+        print(f"❌ Hallucination filtering validation failed: {str(e)}")
+        return False
+
 def main():
     print("=================================================================")
     print("🚀 Starting AccessVision YOLOv8n vs YOLOv8s Performance Benchmark")
@@ -196,6 +299,10 @@ def main():
     # Run functional validations first
     mirroring_passed = validate_image_mirroring()
     grid_passed = validate_grid_narration()
+    dark_blue_passed = validate_dark_object_color()
+    blue_black_passed = validate_blue_vs_black()
+    textured_passed = validate_textured_surface_color()
+    hallucination_passed = validate_hallucination_filtering()
     
     # Run performance benchmarking
     test_image = generate_test_image()
@@ -231,6 +338,10 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 | :--- | :--- | :--- |
 | **Backend Image Mirroring** | {"✅ Passed" if mirroring_passed else "❌ Failed"} | Verified horizontal pixel flipping on client selfie captures. |
 | **9-Region Grid Narration** | {"✅ Passed" if grid_passed else "❌ Failed"} | Verified correct spatial quadrant narration construction. |
+| **Dark Blue vs Black Detection** | {"✅ Passed" if dark_blue_passed else "❌ Failed"} | Verified mapping dark blue RGB (15,25,45) as dark blue. |
+| **Blue/Black Color Boundary** | {"✅ Passed" if blue_black_passed else "❌ Failed"} | Verified correct boundary class separation for dark blue and absolute black. |
+| **Textured & Shadowed Surfaces** | {"✅ Passed" if textured_passed else "❌ Failed"} | Verified color extraction on textured pixels with shadows/highlights. |
+| **Hallucination Detection & Filtering** | {"✅ Passed" if hallucination_passed else "❌ Failed"} | Verified removal of ungrounded BLIP entities from scene narration. |
 
 ## Engineering Analysis & Observations
 
@@ -249,4 +360,3 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 
 if __name__ == "__main__":
     main()
-

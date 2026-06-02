@@ -1,3 +1,4 @@
+import re
 from typing import List
 from app.services.base import BaseService
 from app.schemas.detect import DetectionItem
@@ -6,8 +7,74 @@ import logging
 
 logger = logging.getLogger("accessvision")
 
+# 80 standard COCO classes plus common synonyms
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", 
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", 
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", 
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", 
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", 
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", 
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", 
+    "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", 
+    "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", 
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", 
+    "toothbrush",
+    # Common synonyms/variants to prevent hallucination of related terms
+    "table", "sofa", "desk", "computer", "phone", "television", "light"
+]
+
 class NarrationService(BaseService):
     """Combines detections, scene captioning, and hazards to generate descriptive and hazard-aware narration."""
+
+    def filter_hallucinations(self, caption: str, detections: List[DetectionItem]) -> str:
+        """Filters out hallucinated objects from the caption based on YOLO detections."""
+        detected_labels = {d.label.lower() for d in detections}
+        
+        # Identify which COCO classes mentioned in the caption are NOT detected
+        hallucinated = []
+        for cls in COCO_CLASSES:
+            # Check if the class name is present in the caption
+            pattern = rf"\b{cls}s?\b"
+            if re.search(pattern, caption.lower()):
+                if cls not in detected_labels:
+                    # Special case: check if it's a synonym or compound noun that might match
+                    is_substring = False
+                    for dl in detected_labels:
+                        if cls in dl or dl in cls:
+                            is_substring = True
+                            break
+                    if not is_substring:
+                        hallucinated.append(cls)
+                    
+        if not hallucinated:
+            return caption
+            
+        cleaned_caption = caption
+        for word in hallucinated:
+            logger.info(f"[SCENE] Removed hallucinated object: {word}")
+            
+            is_furniture = word in {"bed", "couch", "chair", "dining table", "table", "sofa", "desk"}
+            replacement = "other furniture" if is_furniture else "other items"
+            
+            # Replace "and a/an/the/some <word>" or "and <word>s" with "and other items"
+            pattern_and = rf"\band\s+(?:a\s+|an\s+|the\s+|some\s+)?{word}s?\b"
+            cleaned_caption, count = re.subn(pattern_and, f"and {replacement}", cleaned_caption, flags=re.IGNORECASE)
+            
+            if count == 0:
+                # Replace "with a/an/the/some <word>s?"
+                pattern_with = rf"\bwith\s+(?:a\s+|an\s+|the\s+|some\s+)?{word}s?\b"
+                cleaned_caption, count = re.subn(pattern_with, f"with {replacement}", cleaned_caption, flags=re.IGNORECASE)
+                
+            if count == 0:
+                # General replacement
+                pattern_obj = rf"\b(?:a\s+|an\s+|the\s+|some\s+)?{word}s?\b"
+                cleaned_caption = re.sub(pattern_obj, replacement, cleaned_caption, flags=re.IGNORECASE)
+                
+        # Clean double spaces/punctuation
+        cleaned_caption = re.sub(r',\s*,\s*', ', ', cleaned_caption)
+        cleaned_caption = re.sub(r'\s+', ' ', cleaned_caption).strip()
+        return cleaned_caption
 
     def generate_narration(
         self, 
@@ -23,6 +90,9 @@ class NarrationService(BaseService):
         from app.core.telemetry import trace_stage
         
         with trace_stage("NARRATION"):
+            # Filter hallucinated objects from the BLIP caption using YOLO detections
+            filtered_caption = self.filter_hallucinations(caption, detections)
+            
             # 1. Handle critical hazards first to warn the user immediately
             hazard_warnings = []
             for h in hazards:
@@ -93,7 +163,7 @@ class NarrationService(BaseService):
                 parts.append(f"Caution: {warnings_str}")
 
             # Add caption context
-            clean_caption = caption.strip()
+            clean_caption = filtered_caption.strip()
             if clean_caption:
                 # Capitalize first letter and strip trailing dot
                 if clean_caption.endswith("."):
