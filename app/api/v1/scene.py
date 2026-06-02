@@ -1,4 +1,4 @@
-from fastapi import APIRouter, File, UploadFile, Depends
+from fastapi import APIRouter, File, UploadFile, Depends, Form
 from app.services.scene_service import SceneService
 from app.schemas.scene import SceneAnalysisResult
 from app.api.dependencies import verify_api_key
