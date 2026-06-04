@@ -7,6 +7,8 @@ from app.services.detect_service import DetectService
 from app.services.crop_service import CropService
 from app.services.color_service import ColorService
 from app.services.scene_service import SceneService
+from app.services.florence_service import FlorenceService
+from app.core.config import settings
 from app.schemas.reasoning import ReasoningResult
 from app.schemas.detect import DetectionItem
 from app.utils.image import load_image_from_bytes, save_image_to_bytes
@@ -38,12 +40,12 @@ class QuestionRouterService(BaseService):
     """
 
     def __init__(self):
-        
         self.vqa_service = VqaService()
         self.detect_service = DetectService()
         self.crop_service = CropService()
         self.color_service = ColorService()
         self.scene_service = SceneService()
+        self.florence_service = FlorenceService()
 
     def analyze_question(self, question: str) -> Tuple[str, Optional[str]]:
         """Parses the question to identify intent type and any referenced COCO objects."""
@@ -79,9 +81,36 @@ class QuestionRouterService(BaseService):
         logger.info(f"Routed question: '{question}' -> intent: {intent}, target_object: {target_object}")
         return intent, target_object
 
+    def classify_query_speed(self, question: str) -> str:
+        """Classifies incoming natural language questions into fast, medium, or slow mode."""
+        q = question.lower().strip()
+        
+        # 1. Slow Keywords (OCR / VQA / reading / signs / writing / details)
+        slow_kws = ["read", "text", "sign", "label", "say", "writing", "ocr", "words", "book", "explain", "detail"]
+        # 2. Medium Keywords (Scene description, contextual summaries)
+        medium_kws = ["describe", "scene", "room", "summar", "look like", "what do you see", "caption"]
+        # 3. Fast Keywords (Navigation, presence, counts, spatial localization)
+        fast_kws = ["where", "left", "right", "front", "blocking", "near", "obstacle", "ahead", "in front", "close", "next to", "count", "how many", "there is", "is there", "are there"]
+        
+        # Priority check: check slow first (most specific), then medium, then fast
+        if any(kw in q for kw in slow_kws):
+            return "slow"
+        elif any(kw in q for kw in medium_kws):
+            return "medium"
+        elif any(kw in q for kw in fast_kws):
+            return "fast"
+            
+        # Default fallback is fast for minimal sufficient inference
+        return "fast"
+
     async def route_and_reason(self, image_bytes: bytes, question: str, is_mirrored: bool = False) -> ReasoningResult:
         """Orchestrates the grounded multimodal reasoning flow."""
         intent, target_object = self.analyze_question(question)
+        mode = self.classify_query_speed(question)
+        logger.info(f"[ROUTER] Query classified as {mode.upper()}")
+        if mode == "fast":
+            logger.info("[FAST_PIPELINE] YOLO-only inference selected")
+            
         from app.core.telemetry import trace_stage, get_current_telemetry
         import time
         
@@ -218,33 +247,60 @@ class QuestionRouterService(BaseService):
                     text_bearing_classes = {"stop sign", "book", "bottle", "tv", "laptop", "cell phone"}
                     text_dets = [d for d in detections if d.label in text_bearing_classes]
                     
-                    if text_dets:
-                        # Crop text bearing region to ground VQA
-                        best_match = max(text_dets, key=lambda x: x.confidence)
-                        cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
-                        try:
-                            cropped_bytes = save_image_to_bytes(cropped_pil)
-                        finally:
-                            cropped_pil.close()
-                        
-                        vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
-                        if best_match.confidence >= 0.75:
-                            answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
+                    if settings.MIGRATION_STAGE >= 3:
+                        # Florence-2 OCR pathway
+                        if text_dets:
+                            best_match = max(text_dets, key=lambda x: x.confidence)
+                            cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
+                            try:
+                                cropped_bytes = save_image_to_bytes(cropped_pil)
+                            finally:
+                                cropped_pil.close()
+                            
+                            ocr_text = await self.florence_service.get_ocr(cropped_bytes)
+                            if ocr_text:
+                                answer = f"The isolated {best_match.label} region contains the text: '{ocr_text}'"
+                            else:
+                                vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
+                                answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
+                            grounded_by = "cropped_florence_ocr"
                         else:
-                            answer = f"I think I see a {best_match.label} region. Based on that: {vqa_res.answer}"
-                        grounded_by = "cropped_vqa_ocr"
+                            ocr_text = await self.florence_service.get_ocr(image_bytes)
+                            if ocr_text:
+                                answer = f"The text detected in the image reads: '{ocr_text}'"
+                            else:
+                                vqa_res = await self.vqa_service.answer_question(image_bytes, question)
+                                answer = f"Reading the overall scene: {vqa_res.answer}"
+                            grounded_by = "florence_ocr"
                     else:
-                        # Fallback to full-image VQA with disclaimer
-                        vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                        if target_object:
-                            answer = f"I did not detect a clear {target_object} in the image, but reading the overall scene: {vqa_res.answer}"
+                        # Legacy BLIP OCR pathway
+                        if text_dets:
+                            # Crop text bearing region to ground VQA
+                            best_match = max(text_dets, key=lambda x: x.confidence)
+                            cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
+                            try:
+                                cropped_bytes = save_image_to_bytes(cropped_pil)
+                            finally:
+                                cropped_pil.close()
+                            
+                            vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
+                            if best_match.confidence >= 0.75:
+                                answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
+                            else:
+                                answer = f"I think I see a {best_match.label} region. Based on that: {vqa_res.answer}"
+                            grounded_by = "cropped_vqa_ocr"
                         else:
-                            answer = f"I did not detect any clear sign or text-bearing objects. Here is a general reading: {vqa_res.answer}"
-                        grounded_by = "vqa_fallback"
+                            # Fallback to full-image VQA with disclaimer
+                            vqa_res = await self.vqa_service.answer_question(image_bytes, question)
+                            if target_object:
+                                answer = f"I did not detect a clear {target_object} in the image, but reading the overall scene: {vqa_res.answer}"
+                            else:
+                                answer = f"I did not detect any clear sign or text-bearing objects. Here is a general reading: {vqa_res.answer}"
+                            grounded_by = "vqa_fallback"
 
                 # --- PATHWAY 5: SCENE DESCRIPTION ---
                 elif intent == "scene_description":
-                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored)
+                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored, mode=mode)
                     answer = scene_res.narration
                     detections = scene_res.objects
                     grounded_by = "scene_service"
@@ -255,43 +311,57 @@ class QuestionRouterService(BaseService):
                     detect_res = await self.detect_service.detect_objects(image_bytes)
                     detections = detect_res.detections
                     
-                    # Format a context string listing detected objects and their boxes to help ground spatial reasoning
-                    if detections:
-                        context_elements = []
-                        for d in detections:
-                            # Box is [xmin, ymin, xmax, ymax]
-                            xmin, ymin, xmax, ymax = d.box
-                            # Describe spatial coordinates in human readable terms
-                            w, h = pil_image.size
-                            center_x = (xmin + xmax) / 2.0 / w
-                            center_y = (ymin + ymax) / 2.0 / h
-                            
-                            x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
-                            y_pos = "upper" if center_y < 0.33 else ("lower" if center_y > 0.66 else "middle")
-                            
-                            if x_pos == "center" and y_pos == "middle":
-                                pos_str = "directly in front of you"
-                            elif x_pos == "center" and y_pos == "upper":
-                                pos_str = "directly above you"
-                            elif x_pos == "center" and y_pos == "lower":
-                                pos_str = "directly below you"
-                            elif y_pos == "upper":
-                                pos_str = f"in the upper {x_pos}"
-                            elif y_pos == "lower":
-                                pos_str = f"in the lower {x_pos}"
-                            else:
-                                pos_str = f"to your {x_pos}"
-                            
-                            context_elements.append(f"{d.label} is {pos_str}")
-                        
-                        grounding_context = "Grounded visual object coordinates: " + ", ".join(context_elements) + ". "
-                        augmented_question = f"{grounding_context}Question: {question}"
+                    if target_object and mode == "fast":
+                        # Fast YOLO-only localization path
+                        matching_dets = [d for d in detections if d.label.lower() == target_object.lower()]
+                        if matching_dets:
+                            best_match = max(matching_dets, key=lambda x: x.confidence)
+                            xmin, ymin, xmax, ymax = best_match.box
+                            center_x = (xmin + xmax) / 2.0 / pil_image.width
+                            x_pos = "to your left" if center_x < 0.33 else ("to your right" if center_x > 0.66 else "directly in front of you")
+                            answer = f"The {target_object} is {x_pos}."
+                            grounded_by = "yolo_spatial_fast"
+                        else:
+                            answer = f"I do not see any {target_object} in front of you."
+                            grounded_by = "yolo_spatial_fast"
                     else:
-                        augmented_question = question
-                    
-                    vqa_res = await self.vqa_service.answer_question(image_bytes, augmented_question)
-                    answer = vqa_res.answer
-                    grounded_by = "grounded_vqa_spatial"
+                        # Format a context string listing detected objects and their boxes to help ground spatial reasoning
+                        if detections:
+                            context_elements = []
+                            for d in detections:
+                                # Box is [xmin, ymin, xmax, ymax]
+                                xmin, ymin, xmax, ymax = d.box
+                                # Describe spatial coordinates in human readable terms
+                                w, h = pil_image.size
+                                center_x = (xmin + xmax) / 2.0 / w
+                                center_y = (ymin + ymax) / 2.0 / h
+                                
+                                x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
+                                y_pos = "upper" if center_y < 0.33 else ("lower" if center_y > 0.66 else "middle")
+                                
+                                if x_pos == "center" and y_pos == "middle":
+                                    pos_str = "directly in front of you"
+                                elif x_pos == "center" and y_pos == "upper":
+                                    pos_str = "directly above you"
+                                elif x_pos == "center" and y_pos == "lower":
+                                    pos_str = "directly below you"
+                                elif y_pos == "upper":
+                                    pos_str = f"in the upper {x_pos}"
+                                elif y_pos == "lower":
+                                    pos_str = f"in the lower {x_pos}"
+                                else:
+                                    pos_str = f"to your {x_pos}"
+                                
+                                context_elements.append(f"{d.label} is {pos_str}")
+                            
+                            grounding_context = "Grounded visual object coordinates: " + ", ".join(context_elements) + ". "
+                            augmented_question = f"{grounding_context}Question: {question}"
+                        else:
+                            augmented_question = question
+                        
+                        vqa_res = await self.vqa_service.answer_question(image_bytes, augmented_question)
+                        answer = vqa_res.answer
+                        grounded_by = "grounded_vqa_spatial"
 
                 # --- PATHWAY 7: GENERIC VQA (FALLBACK) ---
                 else:

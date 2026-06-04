@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     YOLO_CONFIDENCE_THRESHOLD: float = 0.5
     CAPTION_MODEL_PATH: str = "Salesforce/blip-image-captioning-base"
     VQA_MODEL_PATH: str = "Salesforce/blip-vqa-base"
+    FLORENCE_MODEL_PATH: str = "microsoft/Florence-2-base"
+    MIGRATION_STAGE: int = 2
+    FLORENCE_CONFIDENCE_THRESHOLD: float = 0.5
+    FLORENCE_SEMAPHORE_LIMIT: int = 2
+    YOLO_SEMAPHORE_LIMIT: int = 10
+    FLORENCE_TIMEOUT: float = 3.0
+    SCENE_SIMILARITY_THRESHOLD: float = 15.0
+    SCENE_STATIC_THRESHOLD: float = 8.0
+    SCENE_IOU_THRESHOLD: float = 0.6
 
     # Performance Optimizations
     MAX_IMAGE_SIZE: int = 640

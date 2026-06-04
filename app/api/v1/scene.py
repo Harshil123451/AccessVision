@@ -9,11 +9,12 @@ router = APIRouter()
     "/analyze",
     response_model=SceneAnalysisResult,
     summary="Generate unified scene understanding",
-    description="Analyzes the image using concurrent YOLO detection and BLIP captioning, assess potential environmental hazards, and produces descriptive accessibility narration."
+    description="Analyzes the image using concurrent YOLO detection and BLIP/Florence-2 captioning, assess potential environmental hazards, and produces descriptive accessibility narration."
 )
 async def analyze_scene(
     file: UploadFile = File(..., description="Target image file"),
     is_mirrored: bool = Form(default=False, description="Whether the camera preview was mirrored"),
+    mode: str = Form(default="fast", description="Inference mode: fast, medium, or slow"),
     service: SceneService = Depends(SceneService),
     api_key: str = Depends(verify_api_key)
 ):
@@ -22,7 +23,7 @@ async def analyze_scene(
     image_bytes = await file.read()
     optimized_bytes = preprocess_image_bytes(image_bytes, is_mirrored=is_mirrored)
     
-    result = await service.analyze_scene(optimized_bytes, is_mirrored=is_mirrored)
+    result = await service.analyze_scene(optimized_bytes, is_mirrored=is_mirrored, mode=mode)
     return result
 
 @router.get(

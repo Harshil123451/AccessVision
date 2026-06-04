@@ -192,14 +192,19 @@ class AccessVisionUser(HttpUser):
         if not image_bytes:
             return
         
+        mode = random.choice(["fast", "medium", "slow"])
         files = {
             "file": (filename, image_bytes, "image/png")
+        }
+        data = {
+            "mode": mode
         }
         with self.client.post(
             "/api/v1/scene/analyze", 
             files=files, 
+            data=data,
             headers=HEADERS, 
-            name="Scene Analysis (YOLO + BLIP)", 
+            name=f"Scene Analysis ({mode.upper()})", 
             catch_response=True
         ) as response:
             if response.status_code == 200:
@@ -256,7 +261,9 @@ def log_performance_telemetry(request_type, name, response_time, response_length
         "Object Detection (YOLO)": 1000,
         "Visual Question Answering (VQA)": 3000,
         "Grounded Query Routing (Orchestrator)": 5000,
-        "Scene Analysis (YOLO + BLIP)": 5000,
+        "Scene Analysis (FAST)": 300,
+        "Scene Analysis (MEDIUM)": 3000,
+        "Scene Analysis (SLOW)": 5000,
         "Caption Generation (BLIP)": 3000
     }
     

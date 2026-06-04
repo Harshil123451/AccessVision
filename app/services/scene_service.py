@@ -1,12 +1,17 @@
 import asyncio
+import time as pytime
 from collections import deque
 from typing import List, Dict, Any, Optional
 from app.services.base import BaseService
 from app.services.detect_service import DetectService
 from app.services.caption_service import CaptionService
+from app.services.florence_service import FlorenceService
 from app.services.narration_service import NarrationService
 from app.schemas.scene import SceneAnalysisResult, HazardItem
 from app.schemas.detect import DetectionItem
+from app.schemas.perception import PerceptionGraph, GroundedObject
+from app.utils.tracker import TemporalConsistencyTracker
+from app.core.config import settings
 import logging
 
 logger = logging.getLogger("accessvision")
@@ -14,16 +19,31 @@ logger = logging.getLogger("accessvision")
 class SceneService(BaseService):
     """Orchestrates overall scene understanding, combining object detection,
     captioning, hazard analysis, and accessibility narration. Maintains a rolling memory
-    of recent scene states.
+    of recent scene states and uses a temporal consistency tracker.
     """
 
     # Static rolling memory queue (stores up to last 10 analyzed scenes)
     _memory = deque(maxlen=10)
+    # Static temporal tracker shared across request-response lifecycles
+    _tracker = TemporalConsistencyTracker(max_inactive_frames=3, iou_threshold=0.3)
+
+    # Class-level static cache variables for temporal reuse (Phase 3)
+    _cached_image_gray = None
+    _cached_detections = None
+    _cached_perception_graph = None
+    _cached_caption = None
+    _cached_narration = None
+    _cached_hazards = None
 
     def __init__(self):
+        from app.services.crop_service import CropService
+        from app.services.color_service import ColorService
         self.detect_service = DetectService()
         self.caption_service = CaptionService()
+        self.florence_service = FlorenceService()
         self.narration_service = NarrationService()
+        self.crop_service = CropService()
+        self.color_service = ColorService()
 
     def _assess_hazards(self, detections: List[DetectionItem]) -> List[HazardItem]:
         """Determines if any of the detected objects pose a hazard based on type and proximity (bounding box height)."""
@@ -40,8 +60,7 @@ class SceneService(BaseService):
             xmin, ymin, xmax, ymax = d.box
             
             # Bounding box coordinates:
-            # We check if coordinate ymax is in the bottom region of the image (e.g. ymax > 400 pixels or > 0.65 normalized)
-            # which indicates close proximity to the ground/feet.
+            # We check if coordinate ymax is in the bottom region of the image
             is_normalized = all(0.0 <= c <= 1.0 for c in d.box)
             proximity_threshold = 0.65 if is_normalized else 640 * 0.65
             
@@ -79,48 +98,319 @@ class SceneService(BaseService):
                 
         return hazards
 
-    async def analyze_scene(self, image_bytes: bytes, detections: Optional[List[DetectionItem]] = None, is_mirrored: bool = False) -> SceneAnalysisResult:
-        """Runs image captioning and object detection. If pre-computed detections are provided,
-        reuses them to bypass redundant object detection inference.
-        """
-        logger.info("Starting unified scene analysis")
+    async def analyze_scene(
+        self, 
+        image_bytes: bytes, 
+        detections: Optional[List[DetectionItem]] = None, 
+        is_mirrored: bool = False,
+        mode: str = "fast"
+    ) -> SceneAnalysisResult:
+        """Runs multi-speed scene understanding based on requested speed mode and temporal cache status."""
+        logger.info(f"Starting scene analysis in mode: {mode}")
+        from app.core.telemetry import trace_stage, get_current_telemetry
+        import numpy as np
         
-        with self.measure_latency() as metrics:
-            caption_task = self.caption_service.generate_caption(image_bytes)
-            
-            if detections is None:
-                # Run captioning and detection concurrently to reduce latency
-                detect_task = self.detect_service.detect_objects(image_bytes)
-                caption_res, detect_res = await asyncio.gather(caption_task, detect_task)
-                caption = caption_res.caption if caption_res.success else ""
-                detections = detect_res.detections if detect_res.success else []
-            else:
-                # Re-use pre-computed detections and run only captioning
-                logger.info("[CACHE] Reused detections in scene analysis")
-                caption_res = await caption_task
-                caption = caption_res.caption if caption_res.success else ""
+        telemetry = get_current_telemetry()
+        
+        caption = ""
+        florence_caption = ""
+        blip_caption = ""
+        
+        # Track latencies
+        yolo_latency = 0.0
+        blip_latency = 0.0
+        florence_latency = 0.0
+        
+        # Load image for service usage
+        from app.utils.image import load_image_from_bytes
+        pil_image = load_image_from_bytes(image_bytes)
+        w, h = pil_image.size
+        
+        # Grayscale downscaled array for visual similarity check (Phase 3)
+        curr_gray = np.array(pil_image.convert("L").resize((32, 32)), dtype=np.float32)
+        
+        is_static = False
+        is_similar = False
+        florence_timeout_occurred = False
+        
+        try:
+            with self.measure_latency() as metrics:
+                # 1. Run YOLO (Fast Loop Core)
+                if detections is None:
+                    t_start = pytime.perf_counter()
+                    detect_res = await self.detect_service.detect_objects(image_bytes)
+                    detections = detect_res.detections if detect_res.success else []
+                    yolo_latency = (pytime.perf_counter() - t_start) * 1000
+                else:
+                    logger.info("[CACHE] Reused detections in scene analysis")
 
-            # Assess hazards
-            hazards = self._assess_hazards(detections)
+                # 2. Check scene similarity with cached frame (Phase 3)
+                if self._cached_image_gray is not None:
+                    diff = np.mean(np.abs(curr_gray - self._cached_image_gray))
+                    if diff < settings.SCENE_STATIC_THRESHOLD:
+                        is_static = True
+                        logger.info(f"[CACHE] Scene similarity diff: {diff:.2f} < STATIC threshold {settings.SCENE_STATIC_THRESHOLD}. Strictly static scene.")
+                    elif diff < settings.SCENE_SIMILARITY_THRESHOLD:
+                        if self._cached_detections is not None:
+                            is_similar = self._check_detection_stability(detections, self._cached_detections, settings.SCENE_IOU_THRESHOLD)
+                            logger.info(f"[CACHE] Scene similarity diff: {diff:.2f} < SIMILARITY threshold {settings.SCENE_SIMILARITY_THRESHOLD}. Detections stable: {is_similar}.")
+                
+                # 3. Resolve caption based on mode and temporal cache (Phase 3 & 5)
+                if mode != "fast" and not (is_static or is_similar):
+                    run_blip = settings.MIGRATION_STAGE < 3
+                    run_florence = True
+                    
+                    tasks = []
+                    if run_blip:
+                        tasks.append(self.caption_service.generate_caption(image_bytes))
+                    if run_florence:
+                        tasks.append(self.florence_service.get_detailed_caption(image_bytes))
+                        
+                    try:
+                        results = await asyncio.wait_for(
+                            asyncio.gather(*tasks, return_exceptions=True),
+                            timeout=settings.FLORENCE_TIMEOUT
+                        )
+                        
+                        idx = 0
+                        if run_blip:
+                            blip_res = results[idx]
+                            if not isinstance(blip_res, Exception) and blip_res.success:
+                                blip_caption = blip_res.caption
+                                blip_latency = blip_res.metrics.get("inference_ms", 0.0)
+                            idx += 1
+                        if run_florence:
+                            florence_res = results[idx]
+                            if not isinstance(florence_res, Exception):
+                                florence_caption = florence_res
+                                if telemetry and "FLORENCE" in telemetry.timings:
+                                    florence_latency = telemetry.timings["FLORENCE"]
+                            idx += 1
+                            
+                        # Side-by-Side comparison logging
+                        logger.info(
+                            f"[MIGRATION EVAL] BLIP Caption: '{blip_caption}' ({blip_latency:.1f}ms) "
+                            f"| Florence-2 Caption: '{florence_caption}'"
+                        )
+                        
+                        # Choose caption for narration
+                        if settings.MIGRATION_STAGE == 1:
+                            caption = blip_caption
+                        else:
+                            caption = florence_caption if florence_caption else blip_caption
+                            
+                    except asyncio.TimeoutError:
+                        logger.warning("[FALLBACK] Florence/BLIP captioning timed out. Falling back to fast narration.")
+                        florence_timeout_occurred = True
+                        caption = ""
+                elif is_static or is_similar:
+                    logger.info("[CACHE] Reused perception graph")
+                    caption = self._cached_caption
+                else:
+                    logger.info("[SCHEDULER] Fast Loop: Skipping captioning models.")
+                    caption = ""
 
-            if is_mirrored:
-                logger.info("[CAMERA] Mirrored preview enabled")
-            else:
-                logger.info("[CAMERA] Mirrored preview disabled")
+                # 4. Slow Loop deep grounding: get Florence-2 objects if mode is slow and no cache hit
+                florence_objects = {"bboxes": [], "labels": []}
+                if mode == "slow" and not (is_static or is_similar) and not florence_timeout_occurred:
+                    logger.info("[SCHEDULER] Slow Loop: Running Florence-2 <OD> task")
+                    try:
+                        florence_objects = await asyncio.wait_for(
+                            self.florence_service.get_objects(image_bytes),
+                            timeout=settings.FLORENCE_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[FALLBACK] Florence <OD> task timed out. Switched to fast mode.")
+                        florence_timeout_occurred = True
 
-            # Generate narration using grounded perception details
-            from app.utils.image import load_image_from_bytes
-            pil_image = load_image_from_bytes(image_bytes)
-            try:
-                narration = self.narration_service.generate_narration(
-                    caption=caption,
-                    detections=detections,
-                    hazards=hazards,
-                    pil_image=pil_image,
-                    recent_memory=self.get_recent_memory()
-                )
-            finally:
-                pil_image.close()
+                # 5. Handle cache hits and timeout fallbacks (Phase 3 & 5)
+                if is_static or is_similar:
+                    logger.info("[CACHE] Reused Florence caption and narration")
+                    perception_graph = self._cached_perception_graph
+                    narration = self._cached_narration
+                    hazards = self._cached_hazards
+                elif florence_timeout_occurred:
+                    if self._cached_narration is not None:
+                        logger.warning("[FALLBACK] Switched to cached narration after timeout")
+                        narration = self._cached_narration
+                        perception_graph = self._cached_perception_graph
+                        caption = self._cached_caption
+                        hazards = self._cached_hazards
+                    else:
+                        logger.warning("[FALLBACK] Switched to fast grounded narration after timeout")
+                        # Build YOLO-only fallback narration text
+                        if detections:
+                            labels = [d.label for d in detections]
+                            labels_unique = list(set(labels))
+                            if len(labels_unique) > 1:
+                                objs_str = ", ".join(labels_unique[:-1]) + f" and {labels_unique[-1]}"
+                            else:
+                                objs_str = labels_unique[0]
+                            a_an = "an" if objs_str[0].lower() in "aeiou" else "a"
+                            narration = f"I can currently detect {a_an} {objs_str}, but detailed scene analysis is still processing."
+                        else:
+                            narration = "I cannot currently detect any objects, and detailed scene analysis is still processing."
+                        
+                        # Build fast YOLO-only perception graph
+                        current_colors = []
+                        for d in detections:
+                            cropped_pil = self.crop_service.crop_object(pil_image, d.box)
+                            try:
+                                color_res = self.color_service.analyze_color(cropped_pil, d.confidence)
+                                current_colors.append(color_res["color_name"])
+                            except Exception:
+                                current_colors.append("unknown")
+                            finally:
+                                cropped_pil.close()
+                                
+                        current_time = asyncio.get_event_loop().time()
+                        tracked_results = self._tracker.update([
+                            {"label": d.label, "box": d.box, "confidence": d.confidence, "source": "YOLO"}
+                            for d in detections
+                        ], current_colors, current_time)
+                        
+                        perception_objects = []
+                        for track in tracked_results:
+                            xmin, ymin, xmax, ymax = track["box"]
+                            center_x = (xmin + xmax) / 2.0 / w
+                            x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
+                            spatial_phrase = f"to your {x_pos}"
+                            perception_objects.append(GroundedObject(
+                                class_name=track["label"],
+                                confidence=track["confidence"],
+                                color=track["color"],
+                                position=spatial_phrase,
+                                size="medium",
+                                grounding_source="YOLO",
+                                narration_confidence="MEDIUM"
+                            ))
+                        perception_graph = PerceptionGraph(objects=perception_objects)
+                        hazards = self._assess_hazards(detections)
+                else:
+                    # Normal pipeline run (cache miss, no timeout)
+                    # Construct Grounded Objects list (Fusion of YOLO and Florence-2)
+                    raw_objects = []
+                    
+                    # Parse YOLO objects
+                    for d in detections:
+                        raw_objects.append({
+                            "label": d.label,
+                            "box": d.box,
+                            "confidence": d.confidence,
+                            "source": "YOLO"
+                        })
+                        
+                    # Parse Florence-2 OD objects in slow mode
+                    if mode == "slow":
+                        f_bboxes = florence_objects.get("bboxes", [])
+                        f_labels = florence_objects.get("labels", [])
+                        for box, label in zip(f_bboxes, f_labels):
+                            raw_objects.append({
+                                "label": label,
+                                "box": box,
+                                "confidence": 0.65,
+                                "source": "Florence"
+                            })
+                            
+                    # Fuse objects (deduplicate overlapping boxes of the same class)
+                    fused_objects = self._fuse_detections(raw_objects)
+                    
+                    # Fetch colors for current detections
+                    current_colors = []
+                    for obj in fused_objects:
+                        cropped_pil = self.crop_service.crop_object(pil_image, obj["box"])
+                        try:
+                            color_res = self.color_service.analyze_color(cropped_pil, obj["confidence"])
+                            current_colors.append(color_res["color_name"])
+                        except Exception:
+                            current_colors.append("unknown")
+                        finally:
+                            cropped_pil.close()
+                            
+                    # Temporal Consistency Tracker
+                    current_time = asyncio.get_event_loop().time()
+                    tracked_results = self._tracker.update(fused_objects, current_colors, current_time)
+                    logger.info(f"[SCENE] Temporal consistency tracker active: {len(tracked_results)} stable objects.")
+                    
+                    # Build Perception Graph
+                    perception_objects = []
+                    for track in tracked_results:
+                        xmin, ymin, xmax, ymax = track["box"]
+                        center_x = (xmin + xmax) / 2.0 / w
+                        ymax_norm = ymax / h
+                        area = ((xmax - xmin) * (ymax - ymin)) / (w * h)
+                        
+                        x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
+                        
+                        if area >= 0.20:
+                            depth = "foreground"
+                            size_desc = "large"
+                        elif ymax_norm > 0.65:
+                            depth = "foreground"
+                            size_desc = "medium"
+                        elif area < 0.04:
+                            depth = "background"
+                            size_desc = "small"
+                        else:
+                            depth = "nearby"
+                            size_desc = "medium"
+                            
+                        if x_pos == "center":
+                            spatial_phrase = f"in the center {depth}" if depth != "nearby" else "nearby in the center"
+                        else:
+                            spatial_phrase = f"in the {depth} to your {x_pos}" if depth != "nearby" else f"to your {x_pos}"
+                            
+                        # Grounding source
+                        source = "YOLO"
+                        for fo in fused_objects:
+                            if fo["label"] == track["label"] and self._calculate_iou(fo["box"], track["box"]) > 0.5:
+                                source = fo["source"]
+                                break
+                                
+                        # Narration confidence tier
+                        if track["confidence"] >= 0.75:
+                            tier = "HIGH"
+                        elif track["confidence"] >= 0.50:
+                            tier = "MEDIUM"
+                        else:
+                            tier = "LOW"
+                            
+                        perception_objects.append(GroundedObject(
+                            class_name=track["label"],
+                            confidence=track["confidence"],
+                            color=track["color"],
+                            position=spatial_phrase,
+                            size=size_desc,
+                            grounding_source=source,
+                            narration_confidence=tier
+                        ))
+                        
+                    perception_graph = PerceptionGraph(objects=perception_objects)
+                    logger.info(f"[SCENE] Perception graph generated with {len(perception_objects)} nodes.")
+
+                    # Assess hazards
+                    hazards = self._assess_hazards(detections)
+
+                    # Generate narration using perception graph
+                    narration = self.narration_service.generate_narration(
+                        caption=caption,
+                        detections=detections,
+                        hazards=hazards,
+                        pil_image=pil_image,
+                        recent_memory=self.get_recent_memory(),
+                        perception_graph=perception_graph
+                    )
+                    
+                    # Update cache static variables since it was a successful, fresh run
+                    SceneService._cached_image_gray = curr_gray
+                    SceneService._cached_detections = detections
+                    SceneService._cached_perception_graph = perception_graph
+                    SceneService._cached_caption = caption
+                    SceneService._cached_narration = narration
+                    SceneService._cached_hazards = hazards
+
+        finally:
+            pil_image.close()
 
         result = SceneAnalysisResult(
             success=True,
@@ -128,6 +418,7 @@ class SceneService(BaseService):
             objects=detections,
             hazards=hazards,
             narration=narration,
+            perception_graph=perception_graph,
             metrics={"inference_ms": metrics["latency_ms"]}
         )
 
@@ -141,6 +432,57 @@ class SceneService(BaseService):
         })
 
         return result
+
+    def _check_detection_stability(self, curr_dets: List[DetectionItem], cached_dets: List[DetectionItem], iou_thresh: float) -> bool:
+        """Determines if the detected objects remain stable frame-to-frame (Phase 3)."""
+        if len(curr_dets) != len(cached_dets):
+            return False
+        
+        matched = 0
+        for cd in curr_dets:
+            for prd in cached_dets:
+                if cd.label.lower() == prd.label.lower():
+                    iou = self._calculate_iou(cd.box, prd.box)
+                    if iou >= iou_thresh:
+                        matched += 1
+                        break
+        return matched == len(curr_dets)
+
+    def _fuse_detections(self, raw_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Combines overlapping boxes of the same class from different models."""
+        sorted_objs = sorted(raw_objects, key=lambda x: x["confidence"], reverse=True)
+        fused = []
+        
+        for obj in sorted_objs:
+            duplicate = False
+            for f in fused:
+                if f["label"].lower() == obj["label"].lower():
+                    iou = self._calculate_iou(f["box"], obj["box"])
+                    if iou > 0.5:
+                        duplicate = True
+                        if obj["source"] != f["source"]:
+                            f["source"] = "YOLO+Florence"
+                        break
+            if not duplicate:
+                fused.append(obj)
+        return fused
+
+    def _calculate_iou(self, b1: List[float], b2: List[float]) -> float:
+        """Calculates Intersection over Union of two bounding boxes."""
+        x1 = max(b1[0], b2[0])
+        y1 = max(b1[1], b2[1])
+        x2 = min(b1[2], b2[2])
+        y2 = min(b1[3], b2[3])
+        
+        w = max(0.0, x2 - x1)
+        h = max(0.0, y2 - y1)
+        inter = w * h
+        
+        a1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+        a2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+        union = a1 + a2 - inter
+        
+        return inter / union if union > 0 else 0.0
 
     @classmethod
     def get_recent_memory(cls) -> List[Dict[str, Any]]:

@@ -85,7 +85,7 @@ class DetectService(BaseService):
             telemetry.add_trace(f"[CACHE STATS] hit_ratio={stats['hit_ratio_percent']}%")
 
         # 2. Acquire concurrency semaphore to protect CPU inference queue
-        async with ModelRegistry.get_semaphore():
+        async with ModelRegistry.get_yolo_semaphore():
             with trace_stage("YOLO"):
                 # 3. Parse and validate image
                 with trace_stage("IMAGE_DECODE"):
