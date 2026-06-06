@@ -13,16 +13,23 @@ class FlorenceModelWrapper(BaseInferenceWrapper):
     def _load_actual_model(self) -> None:
         try:
             import torch
-            from transformers import AutoProcessor, AutoModelForCausalLM
+            from transformers import AutoProcessor, AutoModelForCausalLM, AutoConfig
             
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using device: {self.device} for Florence-2")
             
             # Florence-2 models require trust_remote_code=True
+            config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+            if hasattr(config, "text_config"):
+                if not hasattr(config.text_config, "forced_bos_token_id"):
+                    config.text_config.forced_bos_token_id = getattr(config.text_config, "bos_token_id", 0)
+                    logger.info("[PATCH] Injected missing forced_bos_token_id into Florence2LanguageConfig")
+            
             self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path, 
-                trust_remote_code=True
+                trust_remote_code=True,
+                config=config
             ).to(self.device)
         except ImportError as e:
             logger.error(

@@ -80,8 +80,10 @@ class ObservableSemaphore:
             telemetry.active_inference_tasks = self._active_count
             telemetry.add_trace(f"[QUEUE] active_inference_tasks={self._active_count}")
         
+        acquired = False
         try:
             await self._sem.acquire()
+            acquired = True
             self._active_count += 1
             elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
             
@@ -96,8 +98,13 @@ class ObservableSemaphore:
                     f"Active tasks: {self._active_count}, Waiting tasks: {self._waiting_count - 1}"
                 )
             return True
+        except (Exception, asyncio.CancelledError):
+            if acquired:
+                self._sem.release()
+                self._active_count = max(0, self._active_count - 1)
+            raise
         finally:
-            self._waiting_count -= 1
+            self._waiting_count = max(0, self._waiting_count - 1)
 
     def release(self):
         self._sem.release()

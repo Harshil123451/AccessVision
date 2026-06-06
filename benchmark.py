@@ -14,6 +14,7 @@ from app.schemas.detect import DetectionItem
 from app.services.narration_service import NarrationService
 from app.services.color_service import ColorService
 from app.utils.image import preprocess_image_bytes
+from app.schemas.perception import PerceptionGraph, GroundedObject
 
 def get_memory_usage():
     process = psutil.Process(os.getpid())
@@ -231,7 +232,18 @@ def validate_hallucinated_people():
         caption = "a woman laying on a bed with a laptop"
         img = Image.new("RGB", (640, 640), color=(128, 128, 128))
         
-        narration = service.generate_narration(caption, detections, [], pil_image=img)
+        pg = PerceptionGraph(objects=[
+            GroundedObject(
+                class_name="bed",
+                confidence=0.88,
+                color="unknown",
+                position="in the foreground",
+                size="large",
+                grounding_source="YOLO",
+                narration_confidence="HIGH"
+            )
+        ])
+        narration = service.generate_narration(caption, detections, [], pil_image=img, perception_graph=pg)
         print(f"Original caption: '{caption}'")
         print(f"Generated narration:\n  \"{narration}\"")
         
@@ -261,7 +273,18 @@ def validate_contradictory_narration():
             DetectionItem(label="suitcase", confidence=0.90, box=[100, 100, 300, 300])
         ]
         
-        narration = service.generate_narration("a room with a suitcase", detections, [], pil_image=img, recent_memory=memory)
+        pg = PerceptionGraph(objects=[
+            GroundedObject(
+                class_name="suitcase",
+                confidence=0.90,
+                color="unknown",
+                position="to your left",
+                size="medium",
+                grounding_source="YOLO",
+                narration_confidence="HIGH"
+            )
+        ])
+        narration = service.generate_narration("a room with a suitcase", detections, [], pil_image=img, recent_memory=memory, perception_graph=pg)
         print(f"Generated memory-aware narration:\n  \"{narration}\"")
         
         assert "no longer confident" in narration.lower() or "person was recently visible" in narration.lower(), "Missing person was not acknowledged!"
@@ -284,7 +307,18 @@ def validate_spatial_rewriting():
             DetectionItem(label="clock", confidence=0.88, box=[290, 10, 350, 70])
         ]
         
-        narration = service.generate_narration("a wall with a clock", detections, [], pil_image=img)
+        pg = PerceptionGraph(objects=[
+            GroundedObject(
+                class_name="clock",
+                confidence=0.88,
+                color="unknown",
+                position="in the background",
+                size="small",
+                grounding_source="YOLO",
+                narration_confidence="HIGH"
+            )
+        ])
+        narration = service.generate_narration("a wall with a clock", detections, [], pil_image=img, perception_graph=pg)
         print(f"Generated spatial narration:\n  \"{narration}\"")
         
         # Make sure "above you" and "below you" are NOT in narration

@@ -103,7 +103,7 @@ class QuestionRouterService(BaseService):
         # Default fallback is fast for minimal sufficient inference
         return "fast"
 
-    async def route_and_reason(self, image_bytes: bytes, question: str, is_mirrored: bool = False) -> ReasoningResult:
+    async def route_and_reason(self, image_bytes: bytes, question: str, is_mirrored: bool = False, session_id: Optional[str] = None) -> ReasoningResult:
         """Orchestrates the grounded multimodal reasoning flow."""
         intent, target_object = self.analyze_question(question)
         mode = self.classify_query_speed(question)
@@ -300,7 +300,7 @@ class QuestionRouterService(BaseService):
 
                 # --- PATHWAY 5: SCENE DESCRIPTION ---
                 elif intent == "scene_description":
-                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored, mode=mode)
+                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored, mode=mode, session_id=session_id)
                     answer = scene_res.narration
                     detections = scene_res.objects
                     grounded_by = "scene_service"

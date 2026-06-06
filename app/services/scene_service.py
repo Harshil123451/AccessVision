@@ -22,18 +22,38 @@ class SceneService(BaseService):
     of recent scene states and uses a temporal consistency tracker.
     """
 
-    # Static rolling memory queue (stores up to last 10 analyzed scenes)
-    _memory = deque(maxlen=10)
-    # Static temporal tracker shared across request-response lifecycles
-    _tracker = TemporalConsistencyTracker(max_inactive_frames=3, iou_threshold=0.3)
+    # Session state cache: session_id -> dict containing session data (Phase 3)
+    _sessions = {}
 
-    # Class-level static cache variables for temporal reuse (Phase 3)
-    _cached_image_gray = None
-    _cached_detections = None
-    _cached_perception_graph = None
-    _cached_caption = None
-    _cached_narration = None
-    _cached_hazards = None
+    @classmethod
+    def _get_session_state(cls, session_id: str) -> dict:
+        current_time = pytime.time()
+        
+        # Clean up expired sessions (older than 10 minutes)
+        expired_sessions = [
+            sid for sid, state in cls._sessions.items()
+            if current_time - state.get("last_activity", 0) > 600
+        ]
+        for sid in expired_sessions:
+            cls._sessions.pop(sid, None)
+            
+        if session_id not in cls._sessions:
+            cls._sessions[session_id] = {
+                "tracker": TemporalConsistencyTracker(max_inactive_frames=3, iou_threshold=0.3),
+                "memory": deque(maxlen=10),
+                "cached_image_gray": None,
+                "cached_detections": None,
+                "cached_perception_graph": None,
+                "cached_caption": None,
+                "cached_narration": None,
+                "cached_hazards": None,
+                "cached_time": 0.0,
+                "last_activity": current_time
+            }
+        else:
+            cls._sessions[session_id]["last_activity"] = current_time
+            
+        return cls._sessions[session_id]
 
     def __init__(self):
         from app.services.crop_service import CropService
@@ -103,14 +123,18 @@ class SceneService(BaseService):
         image_bytes: bytes, 
         detections: Optional[List[DetectionItem]] = None, 
         is_mirrored: bool = False,
-        mode: str = "fast"
+        mode: str = "fast",
+        session_id: Optional[str] = None
     ) -> SceneAnalysisResult:
         """Runs multi-speed scene understanding based on requested speed mode and temporal cache status."""
-        logger.info(f"Starting scene analysis in mode: {mode}")
+        logger.info(f"Starting scene analysis in mode: {mode} (session: {session_id})")
         from app.core.telemetry import trace_stage, get_current_telemetry
         import numpy as np
         
         telemetry = get_current_telemetry()
+        
+        sid = session_id or "global_default"
+        state = self._get_session_state(sid)
         
         caption = ""
         florence_caption = ""
@@ -145,14 +169,20 @@ class SceneService(BaseService):
                     logger.info("[CACHE] Reused detections in scene analysis")
 
                 # 2. Check scene similarity with cached frame (Phase 3)
-                if self._cached_image_gray is not None:
-                    diff = np.mean(np.abs(curr_gray - self._cached_image_gray))
+                current_time = asyncio.get_event_loop().time()
+                cached_gray = state["cached_image_gray"]
+                cached_time = state["cached_time"]
+                cache_age = current_time - cached_time if cached_time > 0 else float('inf')
+                
+                if cached_gray is not None and cache_age < 5.0:
+                    diff = np.mean(np.abs(curr_gray - cached_gray))
                     if diff < settings.SCENE_STATIC_THRESHOLD:
                         is_static = True
                         logger.info(f"[CACHE] Scene similarity diff: {diff:.2f} < STATIC threshold {settings.SCENE_STATIC_THRESHOLD}. Strictly static scene.")
                     elif diff < settings.SCENE_SIMILARITY_THRESHOLD:
-                        if self._cached_detections is not None:
-                            is_similar = self._check_detection_stability(detections, self._cached_detections, settings.SCENE_IOU_THRESHOLD)
+                        cached_dets = state["cached_detections"]
+                        if cached_dets is not None:
+                            is_similar = self._check_detection_stability(detections, cached_dets, settings.SCENE_IOU_THRESHOLD)
                             logger.info(f"[CACHE] Scene similarity diff: {diff:.2f} < SIMILARITY threshold {settings.SCENE_SIMILARITY_THRESHOLD}. Detections stable: {is_similar}.")
                 
                 # 3. Resolve caption based on mode and temporal cache (Phase 3 & 5)
@@ -205,7 +235,7 @@ class SceneService(BaseService):
                         caption = ""
                 elif is_static or is_similar:
                     logger.info("[CACHE] Reused perception graph")
-                    caption = self._cached_caption
+                    caption = state["cached_caption"]
                 else:
                     logger.info("[SCHEDULER] Fast Loop: Skipping captioning models.")
                     caption = ""
@@ -226,16 +256,16 @@ class SceneService(BaseService):
                 # 5. Handle cache hits and timeout fallbacks (Phase 3 & 5)
                 if is_static or is_similar:
                     logger.info("[CACHE] Reused Florence caption and narration")
-                    perception_graph = self._cached_perception_graph
-                    narration = self._cached_narration
-                    hazards = self._cached_hazards
+                    perception_graph = state["cached_perception_graph"]
+                    narration = state["cached_narration"]
+                    hazards = state["cached_hazards"]
                 elif florence_timeout_occurred:
-                    if self._cached_narration is not None:
+                    if state["cached_narration"] is not None:
                         logger.warning("[FALLBACK] Switched to cached narration after timeout")
-                        narration = self._cached_narration
-                        perception_graph = self._cached_perception_graph
-                        caption = self._cached_caption
-                        hazards = self._cached_hazards
+                        narration = state["cached_narration"]
+                        perception_graph = state["cached_perception_graph"]
+                        caption = state["cached_caption"]
+                        hazards = state["cached_hazards"]
                     else:
                         logger.warning("[FALLBACK] Switched to fast grounded narration after timeout")
                         # Build YOLO-only fallback narration text
@@ -264,7 +294,7 @@ class SceneService(BaseService):
                                 cropped_pil.close()
                                 
                         current_time = asyncio.get_event_loop().time()
-                        tracked_results = self._tracker.update([
+                        tracked_results = state["tracker"].update([
                             {"label": d.label, "box": d.box, "confidence": d.confidence, "source": "YOLO"}
                             for d in detections
                         ], current_colors, current_time)
@@ -329,7 +359,7 @@ class SceneService(BaseService):
                             
                     # Temporal Consistency Tracker
                     current_time = asyncio.get_event_loop().time()
-                    tracked_results = self._tracker.update(fused_objects, current_colors, current_time)
+                    tracked_results = state["tracker"].update(fused_objects, current_colors, current_time)
                     logger.info(f"[SCENE] Temporal consistency tracker active: {len(tracked_results)} stable objects.")
                     
                     # Build Perception Graph
@@ -387,31 +417,32 @@ class SceneService(BaseService):
                         
                     perception_graph = PerceptionGraph(objects=perception_objects)
                     logger.info(f"[SCENE] Perception graph generated with {len(perception_objects)} nodes.")
-
+ 
                     # Assess hazards
                     hazards = self._assess_hazards(detections)
-
+ 
                     # Generate narration using perception graph
                     narration = self.narration_service.generate_narration(
                         caption=caption,
                         detections=detections,
                         hazards=hazards,
                         pil_image=pil_image,
-                        recent_memory=self.get_recent_memory(),
+                        recent_memory=list(state["memory"]),
                         perception_graph=perception_graph
                     )
                     
-                    # Update cache static variables since it was a successful, fresh run
-                    SceneService._cached_image_gray = curr_gray
-                    SceneService._cached_detections = detections
-                    SceneService._cached_perception_graph = perception_graph
-                    SceneService._cached_caption = caption
-                    SceneService._cached_narration = narration
-                    SceneService._cached_hazards = hazards
-
+                    # Update cache variables since it was a successful, fresh run
+                    state["cached_image_gray"] = curr_gray
+                    state["cached_detections"] = detections
+                    state["cached_perception_graph"] = perception_graph
+                    state["cached_caption"] = caption
+                    state["cached_narration"] = narration
+                    state["cached_hazards"] = hazards
+                    state["cached_time"] = current_time
+ 
         finally:
             pil_image.close()
-
+ 
         result = SceneAnalysisResult(
             success=True,
             caption=caption,
@@ -421,9 +452,9 @@ class SceneService(BaseService):
             perception_graph=perception_graph,
             metrics={"inference_ms": metrics["latency_ms"]}
         )
-
+ 
         # Store in rolling scene memory
-        self._memory.append({
+        state["memory"].append({
             "timestamp": asyncio.get_event_loop().time(),
             "caption": caption,
             "detections": [d.model_dump() for d in detections],
@@ -485,6 +516,8 @@ class SceneService(BaseService):
         return inter / union if union > 0 else 0.0
 
     @classmethod
-    def get_recent_memory(cls) -> List[Dict[str, Any]]:
-        """Returns the rolling memory queue contents."""
-        return list(cls._memory)
+    def get_recent_memory(cls, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Returns the rolling memory queue contents for the given session."""
+        sid = session_id or "global_default"
+        state = cls._get_session_state(sid)
+        return list(state["memory"])
