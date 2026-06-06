@@ -162,7 +162,7 @@ class SceneService(BaseService):
                 # 1. Run YOLO (Fast Loop Core)
                 if detections is None:
                     t_start = pytime.perf_counter()
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
+                    detect_res = await self.detect_service.detect_objects(pil_image)
                     detections = detect_res.detections if detect_res.success else []
                     yolo_latency = (pytime.perf_counter() - t_start) * 1000
                 else:
@@ -194,7 +194,7 @@ class SceneService(BaseService):
                     if run_blip:
                         tasks.append(self.caption_service.generate_caption(image_bytes))
                     if run_florence:
-                        tasks.append(self.florence_service.get_detailed_caption(image_bytes))
+                        tasks.append(self.florence_service.get_detailed_caption(pil_image))
                         
                     try:
                         results = await asyncio.wait_for(
@@ -239,14 +239,14 @@ class SceneService(BaseService):
                 else:
                     logger.info("[SCHEDULER] Fast Loop: Skipping captioning models.")
                     caption = ""
-
+ 
                 # 4. Slow Loop deep grounding: get Florence-2 objects if mode is slow and no cache hit
                 florence_objects = {"bboxes": [], "labels": []}
                 if mode == "slow" and not (is_static or is_similar) and not florence_timeout_occurred:
                     logger.info("[SCHEDULER] Slow Loop: Running Florence-2 <OD> task")
                     try:
                         florence_objects = await asyncio.wait_for(
-                            self.florence_service.get_objects(image_bytes),
+                            self.florence_service.get_objects(pil_image),
                             timeout=settings.FLORENCE_TIMEOUT
                         )
                     except asyncio.TimeoutError:

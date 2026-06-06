@@ -31,6 +31,7 @@ class FlorenceModelWrapper(BaseInferenceWrapper):
                 trust_remote_code=True,
                 config=config
             ).to(self.device)
+            self._warmup()
         except ImportError as e:
             logger.error(
                 "Missing ML dependencies (torch/transformers/einops/timm) for Florence-2. "
@@ -39,6 +40,27 @@ class FlorenceModelWrapper(BaseInferenceWrapper):
             raise ModelInferenceError(f"Failed to load Florence-2 model due to missing packages: {str(e)}")
         except Exception as e:
             raise ModelInferenceError(f"Error loading Florence-2 model: {str(e)}")
+
+    def _warmup(self) -> None:
+        """Runs a dummy inference pass at startup to warm up Florence-2 execution kernels."""
+        try:
+            logger.info("Running Florence-2 model warmup pass...")
+            import torch
+            # Create a black dummy image
+            dummy_image = Image.new("RGB", (640, 640), color=0)
+            task = "<CAPTION>"
+            inputs = self.processor(text=task, images=dummy_image, return_tensors="pt").to(self.device)
+            inference_ctx = torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()
+            with inference_ctx:
+                _ = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=10,
+                    num_beams=1
+                )
+            logger.info("Florence-2 model warmup pass completed successfully.")
+        except Exception as e:
+            logger.warning(f"Florence-2 model warmup pass failed: {str(e)}")
 
     def _unload_actual_model(self) -> None:
         import torch

@@ -1,5 +1,6 @@
 import asyncio
-from typing import Optional
+from typing import Optional, Union
+from PIL import Image
 from app.services.base import BaseService
 from app.ai.registry import ModelRegistry
 from app.core.config import settings
@@ -40,11 +41,11 @@ class DetectService(BaseService):
             "size": len(cls._cache)
         }
 
-    async def detect_objects(self, image_bytes: bytes, confidence: Optional[float] = None) -> DetectionResult:
-        """Asynchronously processes raw image bytes and runs YOLO object detection.
+    async def detect_objects(self, image_input: Union[bytes, Image.Image], confidence: Optional[float] = None) -> DetectionResult:
+        """Asynchronously processes raw image bytes or PIL image and runs YOLO object detection.
         
-        Uses run_in_thread to run synchronous ML inference in a non-blocking worker thread.
-        Uses cached detection results if the exact payload was already processed.
+        Uses run_in_thread with a dedicated YOLO executor pool.
+        Uses cached detection results if the exact payload was already processed (requires image_input to be bytes).
         """
         if confidence is None:
             confidence = settings.YOLO_CONFIDENCE_THRESHOLD
@@ -53,10 +54,13 @@ class DetectService(BaseService):
         from app.core.telemetry import trace_stage, get_current_telemetry
         import time
         
-        # 1. Check cache first to bypass inference pipeline entirely
-        with trace_stage("CACHE_LOOKUP"):
-            cache_key = self._get_cache_key(image_bytes, confidence)
-            has_cached = cache_key in self._cache
+        # 1. Check cache first to bypass inference pipeline entirely (only possible if input is bytes)
+        has_cached = False
+        cache_key = None
+        if isinstance(image_input, bytes):
+            with trace_stage("CACHE_LOOKUP"):
+                cache_key = self._get_cache_key(image_input, confidence)
+                has_cached = cache_key in self._cache
             
         if has_cached:
             DetectService._cache_hits += 1
@@ -76,39 +80,46 @@ class DetectService(BaseService):
             logger.info("[YOLO] Inference completed in 0.0ms (Cache Hit)")
             return cached_result
             
-        DetectService._cache_misses += 1
-        stats = self.get_cache_stats()
-        logger.info(f"[CACHE MISS] executing inference | hit_ratio={stats['hit_ratio_percent']}%")
-        telemetry = get_current_telemetry()
-        if telemetry:
-            telemetry.add_trace("[CACHE MISS] executing inference")
-            telemetry.add_trace(f"[CACHE STATS] hit_ratio={stats['hit_ratio_percent']}%")
+        if isinstance(image_input, bytes):
+            DetectService._cache_misses += 1
+            stats = self.get_cache_stats()
+            logger.info(f"[CACHE MISS] executing inference | hit_ratio={stats['hit_ratio_percent']}%")
+            telemetry = get_current_telemetry()
+            if telemetry:
+                telemetry.add_trace("[CACHE MISS] executing inference")
+                telemetry.add_trace(f"[CACHE STATS] hit_ratio={stats['hit_ratio_percent']}%")
 
         # 2. Acquire concurrency semaphore to protect CPU inference queue
         async with ModelRegistry.get_yolo_semaphore():
             with trace_stage("YOLO"):
                 # 3. Parse and validate image
+                should_close_image = False
                 with trace_stage("IMAGE_DECODE"):
-                    image = load_image_from_bytes(image_bytes)
+                    if isinstance(image_input, bytes):
+                        image = load_image_from_bytes(image_input)
+                        should_close_image = True
+                    else:
+                        image = image_input
                 
                 # 4. Optimize image resolution for inference
                 with trace_stage("RESIZE"):
                     optimized_image = resize_image_for_model(image, max_size=640)
                 
-                # 5. Perform inference inside thread pool
-                base_confidence = min(0.25, confidence)
+                # 5. Perform inference inside the dedicated YOLO thread pool
                 yolo_start = time.perf_counter()
                 raw_detections = await run_in_thread(
                     self.model_wrapper.predict, 
                     optimized_image, 
-                    confidence_threshold=base_confidence
+                    confidence_threshold=confidence,
+                    executor=ModelRegistry.get_yolo_executor()
                 )
                 yolo_latency_ms = round((time.perf_counter() - yolo_start) * 1000, 2)
                 
                 # 6. Clean up PIL images explicitly to save RAM
                 if optimized_image is not image:
                     optimized_image.close()
-                image.close()
+                if should_close_image:
+                    image.close()
 
             # 7. Map raw output list of dicts to schema items, filtering by target confidence
             raw_count = len(raw_detections)

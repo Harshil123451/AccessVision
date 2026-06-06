@@ -14,6 +14,7 @@ class YoloModelWrapper(BaseInferenceWrapper):
         try:
             from ultralytics import YOLO
             self.model = YOLO(self.model_path)
+            self._warmup()
         except ImportError as e:
             logger.error(
                 "Missing 'ultralytics' dependency for YOLO detection. "
@@ -22,6 +23,20 @@ class YoloModelWrapper(BaseInferenceWrapper):
             raise ModelInferenceError(f"Failed to load model due to missing packages: {str(e)}")
         except Exception as e:
             raise ModelInferenceError(f"Error loading YOLO model: {str(e)}")
+
+    def _warmup(self) -> None:
+        """Runs a dummy inference pass at startup to warm up CPU execution kernels."""
+        try:
+            logger.info("Running YOLO model warmup pass...")
+            import torch
+            # Create a 640x640 dummy image
+            dummy_image = Image.new("RGB", (640, 640), color=0)
+            inference_ctx = torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()
+            with inference_ctx:
+                _ = self.model(dummy_image, conf=0.25, verbose=False)
+            logger.info("YOLO model warmup pass completed successfully.")
+        except Exception as e:
+            logger.warning(f"YOLO model warmup pass failed: {str(e)}")
 
     def _unload_actual_model(self) -> None:
         # Ultralytics doesn't expose explicit unload easily, garbage collection cleans it.
@@ -42,17 +57,27 @@ class YoloModelWrapper(BaseInferenceWrapper):
         self.load()
         
         try:
-            # Perform inference using YOLO
-            results = self.model(image, conf=confidence_threshold, verbose=False)
+            import torch
+            
+            # Execute inference under inference mode context to disable gradient tracking
+            inference_ctx = torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()
+            with inference_ctx:
+                results = self.model(image, conf=confidence_threshold, verbose=False)
+                
             detections = []
             
             if len(results) > 0:
                 result = results[0]
+                
+                # Retrieve Ultralytics internal sub-stage metrics (in ms)
+                preprocess_ms = result.speed.get("preprocess", 0.0)
+                forward_ms = result.speed.get("inference", 0.0)
+                postprocess_ms = result.speed.get("postprocess", 0.0)
+                
+                parse_start = time.perf_counter()
                 boxes = result.boxes
                 
                 for box in boxes:
-                    # Get coordinates
-                    # xyxy is pixel coords [xmin, ymin, xmax, ymax]
                     xyxy = box.xyxy[0].tolist()
                     conf = float(box.conf[0].item())
                     cls_id = int(box.cls[0].item())
@@ -63,6 +88,22 @@ class YoloModelWrapper(BaseInferenceWrapper):
                         "label": label,
                         "confidence": round(conf, 4)
                     })
+                    
+                parse_ms = (time.perf_counter() - parse_start) * 1000
+                
+                # Record to request-scoped telemetry
+                from app.core.telemetry import get_current_telemetry
+                telemetry = get_current_telemetry()
+                if telemetry:
+                    telemetry.record_timing("YOLO_PREPROCESS", preprocess_ms)
+                    telemetry.record_timing("YOLO_FORWARD", forward_ms)
+                    telemetry.record_timing("YOLO_POSTPROCESS", postprocess_ms)
+                    telemetry.record_timing("YOLO_PARSE", parse_ms)
+                    
+                    telemetry.add_trace(f"[YOLO_PREPROCESS] {preprocess_ms:.1f}ms")
+                    telemetry.add_trace(f"[YOLO_FORWARD] {forward_ms:.1f}ms")
+                    telemetry.add_trace(f"[YOLO_POSTPROCESS] {postprocess_ms:.1f}ms")
+                    telemetry.add_trace(f"[YOLO_PARSE] {parse_ms:.1f}ms")
                     
             return detections
         except Exception as e:

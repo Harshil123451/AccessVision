@@ -48,6 +48,15 @@ class ModelRegistry:
     def load_all(cls) -> None:
         """Pre-loads all models into memory. Call during app startup."""
         logger.info(f"Pre-loading all registered models (Migration Stage: {settings.MIGRATION_STAGE})...")
+        
+        # Prevent PyTorch from spawning excess threads and thrashing CPU cores
+        try:
+            import torch
+            torch.set_num_threads(2)
+            logger.info("Successfully set PyTorch CPU thread limit to 2.")
+        except Exception as e:
+            logger.warning(f"Could not set PyTorch thread limit: {str(e)}")
+            
         cls.get_yolo_wrapper().load()
         cls.get_florence_wrapper().load()
         if settings.MIGRATION_STAGE < 4:
@@ -67,6 +76,17 @@ class ModelRegistry:
             except Exception as e:
                 logger.error(f"Error unloading model wrapper {key}: {str(e)}")
         cls._instances.clear()
+        
+        # Shutdown custom executors
+        if cls._yolo_executor is not None:
+            logger.info("Shutting down YOLO executor...")
+            cls._yolo_executor.shutdown(wait=False)
+            cls._yolo_executor = None
+        if cls._florence_executor is not None:
+            logger.info("Shutting down Florence executor...")
+            cls._florence_executor.shutdown(wait=False)
+            cls._florence_executor = None
+            
         logger.info("All models unloaded.")
 
     _semaphore = None
@@ -75,6 +95,32 @@ class ModelRegistry:
     _florence_semaphore_loop = None
     _yolo_semaphore = None
     _yolo_semaphore_loop = None
+    _yolo_executor = None
+    _florence_executor = None
+
+    @classmethod
+    def get_yolo_executor(cls):
+        """Returns the dedicated ThreadPoolExecutor for YOLO inference."""
+        if cls._yolo_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            cls._yolo_executor = ThreadPoolExecutor(
+                max_workers=settings.YOLO_SEMAPHORE_LIMIT,
+                thread_name_prefix="yolo_worker"
+            )
+            logger.info(f"Initialized dedicated YOLO executor with {settings.YOLO_SEMAPHORE_LIMIT} workers.")
+        return cls._yolo_executor
+
+    @classmethod
+    def get_florence_executor(cls):
+        """Returns the dedicated ThreadPoolExecutor for Florence inference."""
+        if cls._florence_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+            cls._florence_executor = ThreadPoolExecutor(
+                max_workers=settings.FLORENCE_SEMAPHORE_LIMIT,
+                thread_name_prefix="florence_worker"
+            )
+            logger.info(f"Initialized dedicated Florence executor with {settings.FLORENCE_SEMAPHORE_LIMIT} workers.")
+        return cls._florence_executor
 
     @classmethod
     def get_semaphore(cls):
