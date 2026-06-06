@@ -1,4 +1,5 @@
 import abc
+import threading
 from typing import Any
 import logging
 from app.core.config import settings
@@ -16,6 +17,7 @@ class BaseInferenceWrapper(abc.ABC):
         self.model_path = model_path
         self.model = None
         self.is_loaded = False
+        self._lock = threading.Lock()
         logger.info(f"Initialized {self.__class__.__name__} with path '{model_path}'")
 
     def load(self) -> None:
@@ -23,14 +25,17 @@ class BaseInferenceWrapper(abc.ABC):
         if self.is_loaded:
             return
 
-        try:
-            logger.info(f"Loading actual model weights for {self.__class__.__name__} from {self.model_path}")
-            self._load_actual_model()
-            self.is_loaded = True
-            logger.info(f"Successfully loaded actual model weights for {self.__class__.__name__}")
-        except Exception as e:
-            logger.exception(f"Failed to load weights for {self.__class__.__name__}: {str(e)}")
-            raise e
+        with self._lock:
+            if self.is_loaded:
+                return
+            try:
+                logger.info(f"Loading actual model weights for {self.__class__.__name__} from {self.model_path}")
+                self._load_actual_model()
+                self.is_loaded = True
+                logger.info(f"Successfully loaded actual model weights for {self.__class__.__name__}")
+            except Exception as e:
+                logger.exception(f"Failed to load weights for {self.__class__.__name__}: {str(e)}")
+                raise e
 
     def unload(self) -> None:
         """Standard unloading lifecycle hook. Releases memory buffers."""

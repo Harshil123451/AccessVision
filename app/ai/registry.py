@@ -39,9 +39,10 @@ class ModelRegistry:
 
     @classmethod
     def get_florence_wrapper(cls) -> FlorenceModelWrapper:
+        from app.ai.florence_model import get_model
         key = f"florence_{settings.FLORENCE_MODEL_PATH}"
         if key not in cls._instances:
-            cls._instances[key] = FlorenceModelWrapper(settings.FLORENCE_MODEL_PATH)
+            cls._instances[key] = get_model(settings.FLORENCE_MODEL_PATH)
         return cls._instances[key]
 
     @classmethod
@@ -58,13 +59,15 @@ class ModelRegistry:
             logger.warning(f"Could not set PyTorch thread limit: {str(e)}")
             
         cls.get_yolo_wrapper().load()
-        cls.get_florence_wrapper().load()
+        # Note: Florence-2 model is loaded lazily on the first request to prevent startup timeouts
         if settings.MIGRATION_STAGE < 4:
             cls.get_caption_wrapper().load()
             cls.get_vqa_wrapper().load()
         else:
             logger.info("Retirement Stage 4 active: Skipping BLIP pre-loading.")
         logger.info("All registered models pre-loaded successfully.")
+
+
 
     @classmethod
     def unload_all(cls) -> None:
