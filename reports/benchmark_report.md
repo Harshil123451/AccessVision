@@ -6,13 +6,13 @@ This benchmark compares `yolov8n.pt` and `yolov8s.pt` on the user's system to un
 
 | Metric | YOLOv8 Nano (`yolov8n.pt`) | YOLOv8 Small (`yolov8s.pt`) | Delta / Comparison |
 | :--- | :--- | :--- | :--- |
-| **Model Load Time** | 18.7 ms | 24.4 ms | 1.3x load time |
-| **RAM Overhead (Load)** | 20.75 MB | 12.60 MB | +-8.15 MB |
-| **Peak RAM Usage** | 368.53 MB | 459.78 MB | +91.25 MB |
-| **Average Latency** | 30.8 ms | 71.8 ms | 2.3x latency |
-| **Median Latency** | 30.9 ms | 71.4 ms | - |
-| **Latency Range** | 25.7 - 35.0 ms | 65.7 - 76.7 ms | - |
-| **Average CPU Util** | 18.0% | 17.8% | - |
+| **Model Load Time** | 21.1 ms | 26.1 ms | 1.2x load time |
+| **RAM Overhead (Load)** | 20.75 MB | 12.66 MB | +-8.09 MB |
+| **Peak RAM Usage** | 368.32 MB | 459.12 MB | +90.80 MB |
+| **Average Latency** | 35.4 ms | 114.3 ms | 3.2x latency |
+| **Median Latency** | 34.0 ms | 108.1 ms | - |
+| **Latency Range** | 29.9 - 43.9 ms | 66.9 - 210.0 ms | - |
+| **Average CPU Util** | 19.7% | 22.1% | - |
 | **Raw Detections (>0.25)** | 1 | 1 | - |
 | **Accepted Detections (>0.5)** | 1 | 1 | - |
 | **Mean Accepted Confidence** | 90.76% | 90.29% | - |
