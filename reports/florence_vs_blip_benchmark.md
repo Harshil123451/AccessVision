@@ -6,10 +6,10 @@ This report compares Salesforce BLIP with Microsoft Florence-2-base on the Acces
 
 | Task | Salesforce BLIP (Legacy) | Microsoft Florence-2 (New) | Comparison |
 | :--- | :--- | :--- | :--- |
-| **Image Captioning (Avg)** | 1017.6 ms | 2609.8 ms | 0.4x speedup / difference |
-| **Visual Question Answering (Avg)** | 450.6 ms | 1542.8 ms | 0.3x speedup / difference |
+| **Image Captioning (Avg)** | 1100.4 ms | 2449.0 ms | 0.4x speedup / difference |
+| **Visual Question Answering (Avg)** | 475.5 ms | 1593.6 ms | 0.3x speedup / difference |
 | **Model Load RAM Overhead** | ~350 MB | ~770 MB | Florence-2 is heavier in memory |
-| **Total Memory footprint** | 3873.6 MB | 3873.6 MB | Matches Hugging Face free tier limit (16GB) |
+| **Total Memory footprint** | 3879.1 MB | 3879.1 MB | Matches Hugging Face free tier limit (16GB) |
 
 ## Perception & Reliability Verification
 

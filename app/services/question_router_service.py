@@ -141,10 +141,15 @@ class QuestionRouterService(BaseService):
                         # Select the highest confidence detection
                         best_match = max(matching_dets, key=lambda x: x.confidence)
                         # Crop image region with default safety inset
-                        cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
+                        with trace_stage("COLOR_CROP"):
+                            cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
                         try:
                             # Extract dominant color and confidence
-                            color_analysis = self.color_service.analyze_color(cropped_pil, best_match.confidence)
+                            color_analysis = self.color_service.analyze_color(
+                                cropped_pil, 
+                                best_match.confidence, 
+                                fast_mode=(mode == "fast")
+                            )
                             color_name = color_analysis["color_name"]
                             color_conf = color_analysis["confidence"]
                         finally:

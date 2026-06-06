@@ -190,3 +190,84 @@ class NarrationService(BaseService):
             logger.info(f"[SCENE] Narration confidence: {overall_confidence}")
 
             return " ".join(parts)
+
+    def generate_fallback_narration(
+        self, 
+        detections: List[DetectionItem], 
+        hazards: List[HazardItem],
+        pil_image: Optional[Image.Image] = None
+    ) -> str:
+        """Generates a complete, intentional accessibility narration when Florence-2 times out."""
+        if not detections:
+            return "I cannot currently detect any objects. No immediate obstacles are detected nearby."
+
+        # Get image dimensions
+        w, h = pil_image.size if pil_image else (640, 640)
+
+        object_sentences = []
+        for i, d in enumerate(detections):
+            # Focus on the top 4 primary detections to keep narration concise and clear
+            if i >= 4:
+                break
+
+            label = d.label.lower()
+            xmin, ymin, xmax, ymax = d.box
+            area = ((xmax - xmin) * (ymax - ymin)) / (w * h)
+            center_x = (xmin + xmax) / 2.0 / w
+            ymax_norm = ymax / h
+
+            # Size classification
+            if area >= 0.20:
+                size_desc = "large"
+            elif area >= 0.05:
+                size_desc = "medium"
+            else:
+                size_desc = "small"
+
+            # Spatial mapping
+            x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
+            if x_pos == "center":
+                if ymax_norm > 0.5:
+                    position_phrase = "directly ahead of you"
+                else:
+                    position_phrase = "in the background center"
+            else:
+                position_phrase = f"to your {x_pos}"
+
+            # Fast path color classification
+            color_name = "unknown"
+            if pil_image:
+                from app.core.telemetry import trace_stage
+                with trace_stage("COLOR_CROP"):
+                    cropped_pil = self.crop_service.crop_object(pil_image, d.box)
+                try:
+                    color_res = self.color_service.analyze_color(cropped_pil, d.confidence, fast_mode=True)
+                    color_name = color_res["color_name"]
+                except Exception:
+                    pass
+                finally:
+                    cropped_pil.close()
+
+            # Construct sentence structures
+            a_an = "An" if label[0].lower() in 'aeiou' else "A"
+            if size_desc == "medium":
+                object_sentences.append(f"{a_an} {label} is {position_phrase}.")
+            else:
+                object_sentences.append(f"{a_an} {size_desc} {label} is {position_phrase}.")
+
+            if color_name != "unknown":
+                object_sentences.append(f"The {label} appears {color_name} in colour.")
+
+        # Obstacle analysis
+        hazard_warnings = []
+        for hz in hazards:
+            if hz.severity in ["medium", "high"]:
+                hazard_warnings.append(hz.description)
+
+        if hazard_warnings:
+            warnings_str = " ".join(hazard_warnings)
+            object_sentences.append(f"Caution: {warnings_str}")
+        else:
+            object_sentences.append("No immediate obstacles are detected nearby.")
+
+        return " ".join(object_sentences)

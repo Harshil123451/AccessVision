@@ -260,62 +260,70 @@ class SceneService(BaseService):
                     narration = state["cached_narration"]
                     hazards = state["cached_hazards"]
                 elif florence_timeout_occurred:
-                    if state["cached_narration"] is not None:
-                        logger.warning("[FALLBACK] Switched to cached narration after timeout")
-                        narration = state["cached_narration"]
-                        perception_graph = state["cached_perception_graph"]
-                        caption = state["cached_caption"]
-                        hazards = state["cached_hazards"]
-                    else:
-                        logger.warning("[FALLBACK] Switched to fast grounded narration after timeout")
-                        # Build YOLO-only fallback narration text
-                        if detections:
-                            labels = [d.label for d in detections]
-                            labels_unique = list(set(labels))
-                            if len(labels_unique) > 1:
-                                objs_str = ", ".join(labels_unique[:-1]) + f" and {labels_unique[-1]}"
-                            else:
-                                objs_str = labels_unique[0]
-                            a_an = "an" if objs_str[0].lower() in "aeiou" else "a"
-                            narration = f"I can currently detect {a_an} {objs_str}, but detailed scene analysis is still processing."
-                        else:
-                            narration = "I cannot currently detect any objects, and detailed scene analysis is still processing."
-                        
-                        # Build fast YOLO-only perception graph
-                        current_colors = []
-                        for d in detections:
+                    logger.warning("[FALLBACK] Switched to fast grounded narration after timeout")
+                    hazards = self._assess_hazards(detections)
+                    narration = self.narration_service.generate_fallback_narration(
+                        detections=detections,
+                        hazards=hazards,
+                        pil_image=pil_image
+                    )
+                    
+                    # Build fast YOLO-only perception graph
+                    current_colors = []
+                    for d in detections:
+                        with trace_stage("COLOR_CROP"):
                             cropped_pil = self.crop_service.crop_object(pil_image, d.box)
-                            try:
-                                color_res = self.color_service.analyze_color(cropped_pil, d.confidence)
-                                current_colors.append(color_res["color_name"])
-                            except Exception:
-                                current_colors.append("unknown")
-                            finally:
-                                cropped_pil.close()
-                                
-                        current_time = asyncio.get_event_loop().time()
-                        tracked_results = state["tracker"].update([
-                            {"label": d.label, "box": d.box, "confidence": d.confidence, "source": "YOLO"}
-                            for d in detections
-                        ], current_colors, current_time)
+                        try:
+                            color_res = self.color_service.analyze_color(cropped_pil, d.confidence, fast_mode=True)
+                            current_colors.append(color_res["color_name"])
+                        except Exception:
+                            current_colors.append("unknown")
+                        finally:
+                            cropped_pil.close()
+                            
+                    current_time = asyncio.get_event_loop().time()
+                    tracked_results = state["tracker"].update([
+                        {"label": d.label, "box": d.box, "confidence": d.confidence, "source": "YOLO"}
+                        for d in detections
+                    ], current_colors, current_time)
+                    
+                    perception_objects = []
+                    for track in tracked_results:
+                        xmin, ymin, xmax, ymax = track["box"]
+                        center_x = (xmin + xmax) / 2.0 / w
+                        ymax_norm = ymax / h
+                        area = ((xmax - xmin) * (ymax - ymin)) / (w * h)
                         
-                        perception_objects = []
-                        for track in tracked_results:
-                            xmin, ymin, xmax, ymax = track["box"]
-                            center_x = (xmin + xmax) / 2.0 / w
-                            x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
-                            spatial_phrase = f"to your {x_pos}"
-                            perception_objects.append(GroundedObject(
-                                class_name=track["label"],
-                                confidence=track["confidence"],
-                                color=track["color"],
-                                position=spatial_phrase,
-                                size="medium",
-                                grounding_source="YOLO",
-                                narration_confidence="MEDIUM"
-                            ))
-                        perception_graph = PerceptionGraph(objects=perception_objects)
-                        hazards = self._assess_hazards(detections)
+                        x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
+                        
+                        if area >= 0.20:
+                            depth = "foreground"
+                            size_desc = "large"
+                        elif ymax_norm > 0.65:
+                            depth = "foreground"
+                            size_desc = "medium"
+                        elif area < 0.04:
+                            depth = "background"
+                            size_desc = "small"
+                        else:
+                            depth = "nearby"
+                            size_desc = "medium"
+                            
+                        if x_pos == "center":
+                            spatial_phrase = f"in the center {depth}" if depth != "nearby" else "nearby in the center"
+                        else:
+                            spatial_phrase = f"in the {depth} to your {x_pos}" if depth != "nearby" else f"to your {x_pos}"
+                            
+                        perception_objects.append(GroundedObject(
+                            class_name=track["label"],
+                            confidence=track["confidence"],
+                            color=track["color"],
+                            position=spatial_phrase,
+                            size=size_desc,
+                            grounding_source="YOLO",
+                            narration_confidence="MEDIUM"
+                        ))
+                    perception_graph = PerceptionGraph(objects=perception_objects)
                 else:
                     # Normal pipeline run (cache miss, no timeout)
                     # Construct Grounded Objects list (Fusion of YOLO and Florence-2)
@@ -348,9 +356,10 @@ class SceneService(BaseService):
                     # Fetch colors for current detections
                     current_colors = []
                     for obj in fused_objects:
-                        cropped_pil = self.crop_service.crop_object(pil_image, obj["box"])
+                        with trace_stage("COLOR_CROP"):
+                            cropped_pil = self.crop_service.crop_object(pil_image, obj["box"])
                         try:
-                            color_res = self.color_service.analyze_color(cropped_pil, obj["confidence"])
+                            color_res = self.color_service.analyze_color(cropped_pil, obj["confidence"], fast_mode=(mode == "fast"))
                             current_colors.append(color_res["color_name"])
                         except Exception:
                             current_colors.append("unknown")
