@@ -1,5 +1,6 @@
 import re
-from typing import Tuple, Optional, List
+import asyncio
+from typing import Tuple, Optional, List, Dict, Any
 from PIL import Image
 from app.services.base import BaseService
 from app.services.vqa_service import VqaService
@@ -8,9 +9,11 @@ from app.services.crop_service import CropService
 from app.services.color_service import ColorService
 from app.services.scene_service import SceneService
 from app.services.florence_service import FlorenceService
+from app.services.enrichment_cache import enrichment_cache
 from app.core.config import settings
 from app.schemas.reasoning import ReasoningResult
 from app.schemas.detect import DetectionItem
+from app.schemas.perception import PerceptionGraph, GroundedObject
 from app.utils.image import load_image_from_bytes, save_image_to_bytes
 import logging
 
@@ -53,64 +56,56 @@ class QuestionRouterService(BaseService):
 
         # 1. Detect target object (look for COCO classes in the question)
         target_object = None
-        # Sort classes by length descending to match longer multi-word classes first
         sorted_classes = sorted(COCO_CLASSES, key=len, reverse=True)
         for cls in sorted_classes:
-            # Use word boundaries to avoid partial matches (e.g., "car" in "carpet")
             pattern = rf"\b{cls}s?\b"
             if re.search(pattern, q_lower):
                 target_object = cls
                 break
 
-        # 2. Detect intent type based on trigger keywords
+        # 2. Classify intent type into Phase 3 classes
+        # FAST_COLOR_QUERY
         if "color" in q_lower:
-            intent = "color"
-        elif any(kw in q_lower for kw in ["how many", "count", "number of"]):
-            intent = "counting"
-        elif any(kw in q_lower for kw in ["is there", "are there", "do you see", "presence"]):
-            intent = "object_presence"
-        elif any(kw in q_lower for kw in ["read", "text", "sign", "writing", "ocr", "says"]):
-            intent = "reading_text"
-        elif any(kw in q_lower for kw in ["describe", "caption", "what do you see", "look like"]):
-            intent = "scene_description"
-        elif any(kw in q_lower for kw in ["next to", "above", "below", "left of", "right of", "beside", "near"]):
-            intent = "spatial_reasoning"
+            intent = "FAST_COLOR_QUERY"
+        # OCR_QUERY
+        elif any(kw in q_lower for kw in ["read", "label", "text", "sign", "writing", "ocr", "says", "words"]):
+            intent = "OCR_QUERY"
+        # DETAILED_SCENE_QUERY
+        elif any(kw in q_lower for kw in ["describe the room", "describe the scene", "describe the environment", "what do you see"]):
+            intent = "DETAILED_SCENE_QUERY"
+        # FAST_OBJECT_QUERY keywords
+        elif any(kw in q_lower for kw in ["in front of", "ahead", "blocking", "obstacle", "where is", "is there", "are there", "do you see", "how many", "count"]):
+            intent = "FAST_OBJECT_QUERY"
+        elif "what objects" in q_lower or "what is in front" in q_lower or "what do i have in front" in q_lower:
+            intent = "FAST_OBJECT_QUERY"
+        elif "what do you see" in q_lower:
+            intent = "DETAILED_SCENE_QUERY"
         else:
-            intent = "generic_vqa"
+            # Fallback check
+            if target_object and any(q_lower.startswith(prefix) for prefix in ["is there", "are there", "do you see", "can you see"]):
+                intent = "FAST_OBJECT_QUERY"
+            else:
+                intent = "VQA_QUERY"
 
         logger.info(f"Routed question: '{question}' -> intent: {intent}, target_object: {target_object}")
         return intent, target_object
 
     def classify_query_speed(self, question: str) -> str:
         """Classifies incoming natural language questions into fast, medium, or slow mode."""
-        q = question.lower().strip()
-        
-        # 1. Slow Keywords (OCR / VQA / reading / signs / writing / details)
-        slow_kws = ["read", "text", "sign", "label", "say", "writing", "ocr", "words", "book", "explain", "detail"]
-        # 2. Medium Keywords (Scene description, contextual summaries)
-        medium_kws = ["describe", "scene", "room", "summar", "look like", "what do you see", "caption"]
-        # 3. Fast Keywords (Navigation, presence, counts, spatial localization)
-        fast_kws = ["where", "left", "right", "front", "blocking", "near", "obstacle", "ahead", "in front", "close", "next to", "count", "how many", "there is", "is there", "are there"]
-        
-        # Priority check: check slow first (most specific), then medium, then fast
-        if any(kw in q for kw in slow_kws):
-            return "slow"
-        elif any(kw in q for kw in medium_kws):
-            return "medium"
-        elif any(kw in q for kw in fast_kws):
+        intent, _ = self.analyze_question(question)
+        if intent in ["FAST_OBJECT_QUERY", "FAST_COLOR_QUERY"]:
             return "fast"
-            
-        # Default fallback is fast for minimal sufficient inference
-        return "fast"
+        elif intent == "DETAILED_SCENE_QUERY":
+            return "medium"
+        else:
+            return "slow"
 
     async def route_and_reason(self, image_bytes: bytes, question: str, is_mirrored: bool = False, session_id: Optional[str] = None) -> ReasoningResult:
         """Orchestrates the grounded multimodal reasoning flow."""
         intent, target_object = self.analyze_question(question)
         mode = self.classify_query_speed(question)
-        logger.info(f"[ROUTER] Query classified as {mode.upper()}")
-        if mode == "fast":
-            logger.info("[FAST_PIPELINE] YOLO-only inference selected")
-            
+        logger.info(f"[ROUTER] Query classified as {mode.upper()} (Intent: {intent})")
+        
         from app.core.telemetry import trace_stage, get_current_telemetry
         import time
         
@@ -120,35 +115,108 @@ class QuestionRouterService(BaseService):
         # Load and parse original image
         with trace_stage("IMAGE_DECODE"):
             pil_image = load_image_from_bytes(image_bytes)
+        w, h = pil_image.size
         
         detections: List[DetectionItem] = []
         answer = ""
         grounded_by = "fallback"
+        sid = session_id or "global_default"
         
         try:
             with trace_stage("ORCHESTRATOR"):
                 
-                # --- PATHWAY 1: COLOR ANALYSIS ---
-                if intent == "color":
-                    # 1. Detect objects first
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
-                    detections = detect_res.detections
+                # --- PATHWAY 1: FAST OBJECT QUERY (YOLO + Perception Graph only) ---
+                if intent == "FAST_OBJECT_QUERY":
+                    # Run YOLO
+                    detect_res = await self.detect_service.detect_objects(pil_image)
+                    detections = detect_res.detections if detect_res.success else []
                     
-                    # 2. Find target object detections
+                    # Track colors fast
+                    current_colors = []
+                    for d in detections:
+                        with trace_stage("COLOR_CROP"):
+                            cropped_pil = self.crop_service.crop_object(pil_image, d.box)
+                        try:
+                            color_res = self.color_service.analyze_color(cropped_pil, d.confidence, fast_mode=True)
+                            current_colors.append(color_res["color_name"])
+                        except Exception:
+                            current_colors.append("unknown")
+                        finally:
+                            cropped_pil.close()
+                            
+                    # Update tracker
+                    state = self.scene_service._get_session_state(sid)
+                    tracked_results = state["tracker"].update([
+                        {"label": d.label, "box": d.box, "confidence": d.confidence}
+                        for d in detections
+                    ], current_colors, time.time())
+                    
+                    # Build graph
+                    pg = self.scene_service.fast_narration_service.build_perception_graph(tracked_results, w, h)
+                    
+                    # Formulate answer from Perception Graph
+                    if "is there" in question.lower() or "are there" in question.lower() or "do you see" in question.lower():
+                        if target_object:
+                            matching_obj = next((o for o in pg.objects if o.class_name.lower() == target_object.lower()), None)
+                            if matching_obj:
+                                answer = f"Yes, a {target_object} is {matching_obj.position}."
+                            else:
+                                answer = f"No, I do not see a {target_object} in front of you."
+                        else:
+                            if pg.objects:
+                                answer = f"Yes, I see {len(pg.objects)} objects."
+                            else:
+                                answer = "No, I do not see any objects in front of you."
+                    elif "how many" in question.lower() or "count" in question.lower():
+                        if target_object:
+                            matching_count = sum(1 for o in pg.objects if o.class_name.lower() == target_object.lower())
+                            plural = target_object + "s" if not target_object.endswith("s") else target_object
+                            if matching_count == 1:
+                                answer = f"There is one {target_object}."
+                            elif matching_count > 1:
+                                answer = f"There are {matching_count} {plural}."
+                            else:
+                                answer = f"I could not detect any {plural}."
+                        else:
+                            if len(pg.objects) == 1:
+                                answer = "I see only one object."
+                            elif len(pg.objects) > 1:
+                                answer = f"I count {len(pg.objects)} objects."
+                            else:
+                                answer = "I do not see any objects."
+                    else:
+                        # Describe what objects are in front of user
+                        if pg.objects:
+                            desc_list = []
+                            for o in pg.objects:
+                                color_prefix = f"a {o.color}" if o.color != "unknown" else "a"
+                                if color_prefix == "a" and o.class_name[0].lower() in 'aeiou':
+                                    color_prefix = "an"
+                                desc_list.append(f"{color_prefix} {o.class_name} {o.position}")
+                            answer = "I see: " + ", ".join(desc_list) + "."
+                        else:
+                            answer = "I do not see any objects in front of you."
+                            
+                    grounded_by = "yolo_perception_graph"
+
+                # --- PATHWAY 2: FAST COLOR QUERY (YOLO + Color Service) ---
+                elif intent == "FAST_COLOR_QUERY":
+                    # Run YOLO
+                    detect_res = await self.detect_service.detect_objects(pil_image)
+                    detections = detect_res.detections if detect_res.success else []
+                    
+                    # Find target object detections
                     matching_dets = [d for d in detections if d.label == target_object] if target_object else []
                     
                     if matching_dets:
-                        # Select the highest confidence detection
                         best_match = max(matching_dets, key=lambda x: x.confidence)
-                        # Crop image region with default safety inset
                         with trace_stage("COLOR_CROP"):
                             cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
                         try:
-                            # Extract dominant color and confidence
                             color_analysis = self.color_service.analyze_color(
                                 cropped_pil, 
                                 best_match.confidence, 
-                                fast_mode=(mode == "fast")
+                                fast_mode=True
                             )
                             color_name = color_analysis["color_name"]
                             color_conf = color_analysis["confidence"]
@@ -161,230 +229,59 @@ class QuestionRouterService(BaseService):
                             answer = f"The {target_object} appears to be {color_name}."
                         else: # LOW
                             answer = f"I cannot confidently determine the color of the {target_object}."
-                        grounded_by = "color_service"
+                        grounded_by = "yolo_color_service"
                     else:
-                        # Grounded Uncertainty Response: avoid color hallucination for non-existent objects
                         if target_object:
                             answer = f"I could not confidently detect any {target_object} in the image to determine its color."
                             grounded_by = "grounding_uncertainty"
                         else:
-                            logger.info("No target object identified for color query. Falling back to general VQA.")
-                            vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                            answer = vqa_res.answer
-                            grounded_by = "vqa_fallback"
+                            answer = "Please specify what object color you want to know."
+                            grounded_by = "routing_fallback"
 
-                # --- PATHWAY 2: COUNTING ---
-                elif intent == "counting":
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
-                    detections = detect_res.detections
-                    
-                    if target_object:
-                        matching_dets = [d for d in detections if d.label == target_object]
-                        count = len(matching_dets)
-                        plural = target_object + "s" if not target_object.endswith("s") else target_object
-                        if count == 0:
-                            answer = f"I could not confidently detect any {plural} in the image."
-                        else:
-                            all_high_conf = all(d.confidence >= 0.75 for d in matching_dets)
-                            if all_high_conf:
-                                if count == 1:
-                                    answer = f"There is one {target_object} in the image."
-                                else:
-                                    answer = f"There are {count} {plural} in the image."
-                            else:
-                                if count == 1:
-                                    answer = f"I think there may be a {target_object} in the image."
-                                else:
-                                    answer = f"I think there may be about {count} {plural} in the image."
+                # --- PATHWAY 3: OCR QUERY (Florence OCR) ---
+                elif intent == "OCR_QUERY":
+                    # Check background enrichment cache first
+                    cached_ocr = enrichment_cache.get(sid, "ocr_result")
+                    if cached_ocr:
+                        answer = f"The text detected in the image reads: '{cached_ocr}'"
+                        grounded_by = "enrichment_cache"
                     else:
-                        # Generic counting: count total objects
-                        count = len(detections)
-                        if count == 0:
-                            answer = "I do not see any objects in the scene."
+                        ocr_text = await self.florence_service.get_ocr(image_bytes)
+                        if ocr_text:
+                            answer = f"The text detected in the image reads: '{ocr_text}'"
+                            enrichment_cache.set(sid, "ocr_result", ocr_text)
                         else:
-                            all_high_conf = all(d.confidence >= 0.75 for d in detections)
-                            if all_high_conf:
-                                if count == 1:
-                                    answer = "I see only one object in the scene."
-                                else:
-                                    answer = f"I count {count} objects in the scene."
-                            else:
-                                if count == 1:
-                                    answer = "I think I see one object in the scene."
-                                else:
-                                    answer = f"I think there may be about {count} objects in the scene."
-                    grounded_by = "yolo_detection"
+                            answer = "No text was detected in the scene."
+                        grounded_by = "florence_ocr"
 
-                # --- PATHWAY 3: OBJECT PRESENCE ---
-                elif intent == "object_presence":
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
-                    detections = detect_res.detections
-                    
-                    if target_object:
-                        matching_dets = [d for d in detections if d.label == target_object]
-                        plural = target_object + "s" if not target_object.endswith("s") else target_object
-                        if matching_dets:
-                            confidence = max(d.confidence for d in matching_dets)
-                            if confidence >= 0.75:
-                                answer = f"Yes, I confidently detected a {target_object} in the scene (with {confidence:.0%} confidence)."
-                            else:
-                                answer = f"I think there may be a {target_object} in the scene (detected with {confidence:.0%} confidence)."
-                        else:
-                            # Contradiction Prevention: check rolling scene memory
-                            recent = self.scene_service.get_recent_memory()
-                            prev_labels = {d["label"].lower() for d in recent[-1].get("detections", [])} if recent else set()
-                            if target_object in prev_labels:
-                                answer = f"A {target_object} was recently visible, but I am not confident that it is present now."
-                            else:
-                                answer = f"No, I did not detect any {plural} in the scene."
-                        grounded_by = "yolo_detection"
+                # --- PATHWAY 4: DETAILED SCENE QUERY (Florence Captioning) ---
+                elif intent == "DETAILED_SCENE_QUERY":
+                    # Check background enrichment cache first
+                    cached_caption = enrichment_cache.get(sid, "florence_caption")
+                    if cached_caption:
+                        answer = cached_caption
+                        grounded_by = "enrichment_cache"
                     else:
-                        # Fallback to VQA if no clear target object identified
-                        vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                        answer = vqa_res.answer
-                        grounded_by = "vqa_fallback"
+                        caption = await self.florence_service.get_detailed_caption(pil_image)
+                        answer = caption
+                        enrichment_cache.set(sid, "florence_caption", caption)
+                        grounded_by = "florence_captioning"
 
-                # --- PATHWAY 4: READING TEXT (OCR) ---
-                elif intent == "reading_text":
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
-                    detections = detect_res.detections
-                    
-                    text_bearing_classes = {"stop sign", "book", "bottle", "tv", "laptop", "cell phone"}
-                    text_dets = [d for d in detections if d.label in text_bearing_classes]
-                    
-                    if settings.MIGRATION_STAGE >= 3:
-                        # Florence-2 OCR pathway
-                        if text_dets:
-                            best_match = max(text_dets, key=lambda x: x.confidence)
-                            cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
-                            try:
-                                cropped_bytes = save_image_to_bytes(cropped_pil)
-                            finally:
-                                cropped_pil.close()
-                            
-                            ocr_text = await self.florence_service.get_ocr(cropped_bytes)
-                            if ocr_text:
-                                answer = f"The isolated {best_match.label} region contains the text: '{ocr_text}'"
-                            else:
-                                vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
-                                answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
-                            grounded_by = "cropped_florence_ocr"
-                        else:
-                            ocr_text = await self.florence_service.get_ocr(image_bytes)
-                            if ocr_text:
-                                answer = f"The text detected in the image reads: '{ocr_text}'"
-                            else:
-                                vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                                answer = f"Reading the overall scene: {vqa_res.answer}"
-                            grounded_by = "florence_ocr"
+                # --- PATHWAY 5: VQA QUERY (Florence VQA) ---
+                elif intent == "VQA_QUERY":
+                    cache_key = f"vqa_{question.lower().strip()}"
+                    cached_vqa = enrichment_cache.get(sid, cache_key)
+                    if cached_vqa:
+                        answer = cached_vqa
+                        grounded_by = "enrichment_cache"
                     else:
-                        # Legacy BLIP OCR pathway
-                        if text_dets:
-                            # Crop text bearing region to ground VQA
-                            best_match = max(text_dets, key=lambda x: x.confidence)
-                            cropped_pil = self.crop_service.crop_object(pil_image, best_match.box)
-                            try:
-                                cropped_bytes = save_image_to_bytes(cropped_pil)
-                            finally:
-                                cropped_pil.close()
-                            
-                            vqa_res = await self.vqa_service.answer_question(cropped_bytes, question)
-                            if best_match.confidence >= 0.75:
-                                answer = f"Based on the isolated {best_match.label} region: {vqa_res.answer}"
-                            else:
-                                answer = f"I think I see a {best_match.label} region. Based on that: {vqa_res.answer}"
-                            grounded_by = "cropped_vqa_ocr"
-                        else:
-                            # Fallback to full-image VQA with disclaimer
-                            vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                            if target_object:
-                                answer = f"I did not detect a clear {target_object} in the image, but reading the overall scene: {vqa_res.answer}"
-                            else:
-                                answer = f"I did not detect any clear sign or text-bearing objects. Here is a general reading: {vqa_res.answer}"
-                            grounded_by = "vqa_fallback"
+                        answer_dict = await self.florence_service.run_task(image_bytes, "<VQA>", text_input=question)
+                        answer = answer_dict.get("<VQA>", "I could not answer the question based on the image.")
+                        enrichment_cache.set(sid, cache_key, answer)
+                        grounded_by = "florence_vqa"
 
-                # --- PATHWAY 5: SCENE DESCRIPTION ---
-                elif intent == "scene_description":
-                    scene_res = await self.scene_service.analyze_scene(image_bytes, is_mirrored=is_mirrored, mode=mode, session_id=session_id)
-                    answer = scene_res.narration
-                    detections = scene_res.objects
-                    grounded_by = "scene_service"
-
-                # --- PATHWAY 6: SPATIAL REASONING ---
-                elif intent == "spatial_reasoning":
-                    # Run detection to locate object positions for context
-                    detect_res = await self.detect_service.detect_objects(image_bytes)
-                    detections = detect_res.detections
-                    
-                    if target_object and mode == "fast":
-                        # Fast YOLO-only localization path
-                        matching_dets = [d for d in detections if d.label.lower() == target_object.lower()]
-                        if matching_dets:
-                            best_match = max(matching_dets, key=lambda x: x.confidence)
-                            xmin, ymin, xmax, ymax = best_match.box
-                            center_x = (xmin + xmax) / 2.0 / pil_image.width
-                            x_pos = "to your left" if center_x < 0.33 else ("to your right" if center_x > 0.66 else "directly in front of you")
-                            answer = f"The {target_object} is {x_pos}."
-                            grounded_by = "yolo_spatial_fast"
-                        else:
-                            answer = f"I do not see any {target_object} in front of you."
-                            grounded_by = "yolo_spatial_fast"
-                    else:
-                        # Format a context string listing detected objects and their boxes to help ground spatial reasoning
-                        if detections:
-                            context_elements = []
-                            for d in detections:
-                                # Box is [xmin, ymin, xmax, ymax]
-                                xmin, ymin, xmax, ymax = d.box
-                                # Describe spatial coordinates in human readable terms
-                                w, h = pil_image.size
-                                center_x = (xmin + xmax) / 2.0 / w
-                                center_y = (ymin + ymax) / 2.0 / h
-                                
-                                x_pos = "left" if center_x < 0.33 else ("right" if center_x > 0.66 else "center")
-                                y_pos = "upper" if center_y < 0.33 else ("lower" if center_y > 0.66 else "middle")
-                                
-                                if x_pos == "center" and y_pos == "middle":
-                                    pos_str = "directly in front of you"
-                                elif x_pos == "center" and y_pos == "upper":
-                                    pos_str = "directly above you"
-                                elif x_pos == "center" and y_pos == "lower":
-                                    pos_str = "directly below you"
-                                elif y_pos == "upper":
-                                    pos_str = f"in the upper {x_pos}"
-                                elif y_pos == "lower":
-                                    pos_str = f"in the lower {x_pos}"
-                                else:
-                                    pos_str = f"to your {x_pos}"
-                                
-                                context_elements.append(f"{d.label} is {pos_str}")
-                            
-                            grounding_context = "Grounded visual object coordinates: " + ", ".join(context_elements) + ". "
-                            augmented_question = f"{grounding_context}Question: {question}"
-                        else:
-                            augmented_question = question
-                        
-                        vqa_res = await self.vqa_service.answer_question(image_bytes, augmented_question)
-                        answer = vqa_res.answer
-                        grounded_by = "grounded_vqa_spatial"
-
-                # --- PATHWAY 7: GENERIC VQA (FALLBACK) ---
-                else:
-                    vqa_res = await self.vqa_service.answer_question(image_bytes, question)
-                    answer = vqa_res.answer
-                    grounded_by = "vqa_fallback"
         finally:
             pil_image.close()
-            
-        # Log telemetry details if not already handled by scene service
-        if intent != "scene_description":
-            has_uncertainty = any(d.confidence < 0.75 for d in detections) if detections else False
-            narration_confidence = "LOW" if has_uncertainty else "HIGH"
-            logger.info(f"[SCENE] Narration confidence: {narration_confidence}")
-            if is_mirrored:
-                logger.info("[CAMERA] Mirrored preview enabled")
-            else:
-                logger.info("[CAMERA] Mirrored preview disabled")
 
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
         return ReasoningResult(
@@ -397,3 +294,4 @@ class QuestionRouterService(BaseService):
             detections=detections,
             metrics={"inference_ms": elapsed_ms}
         )
+

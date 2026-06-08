@@ -16,6 +16,7 @@ async def lifespan(app: FastAPI):
     # 1. Initialize logging configuration
     setup_logging()
     logger.info("Initializing FastAPI accessibility application...")
+    logger.info(f"Caption timeout configured: {settings.CAPTION_TIMEOUT_SECONDS}s")
     
     # 2. Warm up/Pre-load models on startup to avoid latency on first API request
     try:

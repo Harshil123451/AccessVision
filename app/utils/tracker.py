@@ -1,4 +1,5 @@
 import time
+import math
 from typing import List, Dict, Any, Optional
 
 class TrackedObject:
@@ -13,6 +14,7 @@ class TrackedObject:
         self.frames_active = 1
         self.frames_inactive = 0
         self.is_decaying = False
+        self.prev_box = box.copy()
 
 class TemporalConsistencyTracker:
     """Smooths out detection frame-to-frame fluctuations using IoU matching and confidence decay."""
@@ -21,6 +23,12 @@ class TemporalConsistencyTracker:
         self.max_inactive_frames = max_inactive_frames
         self.iou_threshold = iou_threshold
         self.decay_rate = decay_rate
+        
+        # Tracked events from the most recent update
+        self.appearances: List[Dict[str, Any]] = []
+        self.disappearances: List[str] = []
+        self.movements: List[str] = []
+        self.scene_stable: bool = False
 
     def update(self, current_detections: List[Dict[str, Any]], current_colors: List[str], current_time: float) -> List[Dict[str, Any]]:
         """Updates tracked objects and returns currently stable/active detections."""
@@ -41,6 +49,18 @@ class TemporalConsistencyTracker:
             union = a1 + a2 - inter
             
             return inter / union if union > 0 else 0.0
+
+        # Save previous active tracks to compute changes
+        prev_states = {}
+        for track in self.tracked_objects:
+            if not track.is_decaying and track.confidence >= 0.20:
+                prev_states[id(track)] = {
+                    "label": track.label,
+                    "box": track.box.copy(),
+                    "center_x": (track.box[0] + track.box[2]) / 2.0,
+                    "center_y": (track.box[1] + track.box[3]) / 2.0,
+                    "color": track.color
+                }
 
         matched_indices = set()
         updated_tracks = []
@@ -64,6 +84,7 @@ class TemporalConsistencyTracker:
             if best_iou >= self.iou_threshold and best_idx != -1:
                 det = current_detections[best_idx]
                 # Found match: update state
+                track.prev_box = track.box.copy()
                 track.box = det["box"]
                 # Rolling confidence smoothing
                 track.confidence = 0.7 * track.confidence + 0.3 * det["confidence"]
@@ -79,6 +100,7 @@ class TemporalConsistencyTracker:
                 track.frames_inactive += 1
                 if track.frames_inactive <= self.max_inactive_frames:
                     # Decay confidence exponentially to prevent sudden disappearance
+                    track.prev_box = track.box.copy()
                     track.confidence *= self.decay_rate
                     track.is_decaying = True
                     updated_tracks.append(track)
@@ -102,7 +124,6 @@ class TemporalConsistencyTracker:
         # 3. Filter active tracks to return to caller
         results = []
         for track in self.tracked_objects:
-            # Suppress very low confidence tracks
             if track.confidence >= 0.20:
                 results.append({
                     "label": track.label,
@@ -112,4 +133,65 @@ class TemporalConsistencyTracker:
                     "frames_active": track.frames_active,
                     "is_decaying": track.is_decaying
                 })
+
+        # 4. Compute appearances, disappearances, and movements
+        self.appearances = []
+        self.disappearances = []
+        self.movements = []
+        
+        # Helper to determine if box is normalized
+        def is_box_normalized(box: List[float]) -> bool:
+            return all(0.0 <= c <= 1.0 for c in box)
+            
+        curr_active_ids = {id(t) for t in self.tracked_objects if not t.is_decaying and t.confidence >= 0.20}
+        
+        # Detect Appearances
+        for track in self.tracked_objects:
+            if not track.is_decaying and track.confidence >= 0.20:
+                if id(track) not in prev_states:
+                    self.appearances.append({
+                        "label": track.label,
+                        "box": track.box,
+                        "color": track.color,
+                        "confidence": track.confidence
+                    })
+                    
+        # Detect Disappearances
+        for prev_id, prev_state in prev_states.items():
+            if prev_id not in curr_active_ids:
+                self.disappearances.append(prev_state["label"])
+                
+        # Detect Movements
+        for track in self.tracked_objects:
+            if not track.is_decaying and track.confidence >= 0.20:
+                prev_state = prev_states.get(id(track))
+                if prev_state:
+                    curr_center_x = (track.box[0] + track.box[2]) / 2.0
+                    curr_center_y = (track.box[1] + track.box[3]) / 2.0
+                    prev_center_x = prev_state["center_x"]
+                    prev_center_y = prev_state["center_y"]
+                    
+                    # Set threshold dynamically based on box coordinate type
+                    norm = is_box_normalized(track.box)
+                    threshold_x = 0.05 if norm else 32.0
+                    threshold_y = 0.05 if norm else 32.0
+                    
+                    dx = curr_center_x - prev_center_x
+                    dy = curr_center_y - prev_center_y
+                    
+                    if abs(dx) > threshold_x or abs(dy) > threshold_y:
+                        if dx < -threshold_x:
+                            self.movements.append(f"The {track.label} has moved to your left.")
+                        elif dx > threshold_x:
+                            self.movements.append(f"The {track.label} has moved to your right.")
+                        else:
+                            self.movements.append(f"The {track.label} has moved.")
+
+        # Determine Scene Stability
+        # A scene is stable if there are no new appearances, no disappearances, and no significant movements,
+        # and we actually have some tracked active objects (to avoid stating empty scenes as static indefinitely)
+        has_active = len(curr_active_ids) > 0
+        self.scene_stable = has_active and not (self.appearances or self.disappearances or self.movements)
+
         return results
+
